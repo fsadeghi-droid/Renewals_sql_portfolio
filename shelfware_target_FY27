@@ -1,0 +1,223 @@
+USE ROLE SNF_BT_BU_CSG_RENEWALS_SPS_PRD_SVC;
+USE WAREHOUSE WH_CSG_RSPS_ANALYSIS;
+USE DATABASE SSE_DM_CSG_RPT_PRD;
+
+WITH
+/* =============================
+   0) Custom split logic
+   ============================= */
+custom_split_reallocation AS (
+    SELECT 'Sales and Service Cloud' AS sc_original, 'Sales Cloud'  AS sc_target, 0.5 AS pct_split
+    UNION ALL
+    SELECT 'Sales and Service Cloud' AS sc_original, 'Service Cloud' AS sc_target, 0.5 AS pct_split
+    UNION ALL
+    SELECT DISTINCT sub_category AS sc_original, sub_category AS sc_target, 1.0 AS pct_split
+    FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW
+    WHERE sub_category <> 'Sales and Service Cloud'
+    QUALIFY MAX(snapshot_dt) OVER (PARTITION BY 1) = snapshot_dt
+),
+
+/* =============================
+   1) Shelf snapshot (account_id is 15-digit)
+   ============================= */
+shelf AS (
+    SELECT
+        snapshot_dt,
+        TRIM(TO_VARCHAR(account_id)) AS account_id_15,
+        sub_category,
+        is_sela,
+        sales_ou,
+        numerator,
+        denominator,
+        shelfware,
+        pov,
+        pov_at_risk
+    From SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW
+    WHERE snapshot_dt = '2026-02-01'
+),
+
+/* =============================
+   2) Apply split
+   ============================= */
+shelf_ss_split AS (
+    SELECT
+        s.snapshot_dt,
+        s.account_id_15,
+        c.sc_target                   AS sub_category,
+        s.is_sela,
+        s.sales_ou,
+        s.numerator   * c.pct_split   AS numerator,
+        s.denominator * c.pct_split   AS denominator,
+        s.shelfware   * c.pct_split   AS shelfware,
+        s.pov         * c.pct_split   AS pov,
+        s.pov_at_risk * c.pct_split   AS pov_at_risk
+    FROM shelf s
+    LEFT JOIN custom_split_reallocation c
+        ON s.sub_category = c.sc_original
+),
+
+/* =============================
+   3) Group after split (keep SALES_OU)
+   ============================= */
+shelf_ss_grouped AS (
+    SELECT
+        snapshot_dt,
+        account_id_15,
+        sub_category,
+        is_sela,
+        sales_ou,
+        SUM(numerator)   AS numerator,
+        SUM(denominator) AS denominator,
+        SUM(shelfware)   AS shelfware,
+        SUM(pov)         AS pov,
+        SUM(pov_at_risk) AS pov_at_risk
+    FROM shelf_ss_split
+    GROUP BY 1,2,3,4,5
+),
+
+/* =============================
+   4) Product mapping to L1/L2/L3
+   ============================= */
+product_mapping AS (
+    SELECT
+        drvd_product_norm AS sub_category,
+        drvd_prod_lvl_1,
+        drvd_prod_lvl_2,
+        drvd_prod_lvl_3,
+        COUNT(*) OVER (PARTITION BY drvd_product_norm) AS map_count
+    FROM (
+        SELECT
+            CASE WHEN drvd_product = 'Core Field Service' THEN 'Field Service'
+                 ELSE drvd_product END AS drvd_product_norm,
+            drvd_prod_lvl_1,
+            drvd_prod_lvl_2,
+            drvd_prod_lvl_3
+        FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_CH_FACT_ORDER_PROVISIONED_VALUE
+        WHERE snapshot_dt = '2025-12-01'
+          AND ch_covered_flg = 'Y'
+        GROUP BY 1,2,3,4
+    )
+),
+
+/* =============================
+   5) Allocate grouped shelf metrics to Product L1/L2/L3
+   ============================= */
+shelf_by_prod AS (
+    SELECT
+        g.snapshot_dt,
+        g.account_id_15,
+        g.is_sela,
+        g.sales_ou,
+
+        pm.drvd_prod_lvl_1,
+        pm.drvd_prod_lvl_2,
+        pm.drvd_prod_lvl_3,
+
+        g.numerator   / NULLIF(COALESCE(pm.map_count,1),0) AS numerator,
+        g.denominator / NULLIF(COALESCE(pm.map_count,1),0) AS denominator,
+        g.shelfware   / NULLIF(COALESCE(pm.map_count,1),0) AS shelfware,
+        g.pov         / NULLIF(COALESCE(pm.map_count,1),0) AS pov,
+        g.pov_at_risk / NULLIF(COALESCE(pm.map_count,1),0) AS pov_at_risk,
+
+        /* Account-level AOV (total POV at account) */
+        SUM(g.pov) OVER (PARTITION BY g.snapshot_dt, g.account_id_15) AS account_aov
+    FROM shelf_ss_grouped g
+    LEFT JOIN product_mapping pm
+        ON g.sub_category = pm.sub_category
+),
+
+/* =============================
+   6) Open/Precautionary Red Accounts to exclude
+   ============================= */
+open_red_accts AS (
+    SELECT DISTINCT LEFT(TRIM(TO_VARCHAR(account_id)), 15) AS account_id_15
+    FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_DIM_RED_ACCOUNT_VW
+    WHERE record_nm IN ('Red Account','Foundation','Multi-Customer Red Account')
+      AND apm_level_1 IS NOT NULL
+      AND red_stg NOT IN ('Invalid','Triage')
+      AND red_stg IN ('Open','Precautionary')
+      AND red_end_dt IS NULL
+),
+
+/* =============================
+   7) Account dim
+   ============================= */
+acct_dim AS (
+    SELECT
+        TRIM(TO_VARCHAR(ACCOUNT_ID)) AS account_id_15,   -- <-- keep your working 15-digit field here
+        ACCOUNT_18_ID,
+        ACCOUNT_NM,
+        COMPANY_GLOBAL_ID,
+        COMBO_COMPANY_ID,
+        COMBO_COMPANY_NM,
+        CSG_TERRITORY
+    FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_DIM_ACCOUNT_VW
+),
+
+/* =============================
+   8) Renewal opportunities FY2027
+   ============================= */
+renewal_opty AS (
+    SELECT
+        LEFT(TRIM(TO_VARCHAR(op.ACCT_ID)), 15) AS account_id_15,
+        op.RENEWAL_OPTY_ID                     AS renewal_opportunity_id,
+        op.RENEWAL_OPTY_NM                     AS opportunity_name,
+        op.RENEWAL_CLSD_DT                     AS renewal_close_date,
+        op.RENEWAL_FISCAL_YEAR                 AS renewal_fiscal_year,
+        op.RENEWAL_FCAST_ATTRITION_CONV        AS opportunity_forecasted_attrition
+    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW op
+    WHERE op.RENEWAL_FISCAL_YEAR = 2027
+      AND op.m_a_legacy_renewal_flag <> 'Y'
+      AND op.RENEWAL_FCAST_CODE NOT IN ('Omitted')
+      AND op.RENEWAL_OPTY_TYPE IN ('Renewal','Contract')
+      AND op.RENEWAL_FCAST_ATTRITION_CONV <= 0
+)
+
+
+SELECT
+    /* ===== Requested fields ===== */
+    acc.ACCOUNT_18_ID                                    AS account_id_18,
+    acc.ACCOUNT_NM,
+    acc.COMPANY_GLOBAL_ID                                AS global_company_id,
+    acc.COMBO_COMPANY_NM                                 AS combo_company,
+    acc.COMBO_COMPANY_ID,
+    acc.CSG_TERRITORY,
+
+    sbp.drvd_prod_lvl_1                                  AS product_l1,
+    sbp.drvd_prod_lvl_2                                  AS product_l2,
+    sbp.drvd_prod_lvl_3                                  AS product_l3,
+
+    ro.renewal_opportunity_id,
+    ro.opportunity_name,
+    ro.renewal_close_date,
+    ro.renewal_fiscal_year,
+
+    /* Shelf outputs  */
+    sbp.sales_ou,
+    sbp.numerator,
+    sbp.denominator,
+    sbp.shelfware,
+    sbp.pov,
+    sbp.pov_at_risk,
+
+    /* Metrics requested */
+    sbp.account_aov                                      AS account_aov,
+    sbp.pov                                              AS account_epov_l3,   -- at Product L3 grain
+    (sbp.pov_at_risk / NULLIF(sbp.pov, 0))               AS shelfware_pct,
+    ro.opportunity_forecasted_attrition
+
+FROM shelf_by_prod sbp
+LEFT JOIN open_red_accts red
+    ON sbp.account_id_15 = red.account_id_15
+LEFT JOIN acct_dim acc
+    ON sbp.account_id_15 = acc.account_id_15
+INNER JOIN renewal_opty ro
+    ON sbp.account_id_15 = ro.account_id_15
+WHERE COALESCE(TRY_TO_BOOLEAN(sbp.is_sela), FALSE) = FALSE
+  AND red.account_id_15 IS NULL
+
+  and sbp.pov_at_risk > 0 
+and acc.CSG_TERRITORY in ('SMB','Tableau Cloud')
+having 
+  (sbp.pov_at_risk / NULLIF(sbp.pov, 0))   > .5
+  --and sbp.pov_at_risk > 20000
