@@ -1,0 +1,744 @@
+-- =============================================================================
+-- Shelfware FY27 — Impact report (split + sub_category → CIDM L1–L3 mapping)
+--
+-- Optional session context:
+--   USE ROLE SNF_BT_BU_CSG_RENEWALS_SPS_PRD_SVC;
+--   USE WAREHOUSE WH_CSG_RSPS_ANALYSIS;
+--   USE DATABASE SSE_DM_CSG_RPT_PRD;
+--
+-- Aligns with shelfware target definition:
+--   • Base population shelf snapshot: 2025-01-31 (latest POV_WEIGHTED_SHELFWARE_TRENDING_VW
+--     row on that date, else latest snapshot ≤ 2025-01-31)
+--   • CIDM provisioned-value (L1–L3): same baseline date for line AOV/EPOV; current = CURR_SNAP
+-- Shelfware source (PRD; PREPRD frozen): OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW
+--   Uses SUB_CATEGORY (and split rules) for mapping; numerator/denominator/shelfware/POV/POV_AT_RISK.
+--
+-- Target list: SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27
+--   Use ONLY from this table: program name, opportunity id, account id, DRVD_PROD_L1–L3.
+--   (No other target-list columns — context comes from renewals/CIDM/shelfware objects.)
+--
+-- PREPRD trending objects are deprecated after next refresh — do not use for new work:
+--   SSE_DM_CSG_RPT_PREPRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING[_VW]
+--
+-- Double counting:
+--   Close dates and renewal product lines live on OPPORTUNITIES; shelfware & CIDM AOV
+--   are naturally ACCOUNT × PRODUCT LINE. If the same product line appears on multiple
+--   target opps, joining at opp×product grain repeats the same shelfware $.
+--   This query exposes:
+--     (A) one canonical row per account × target product line (deduped opps), and
+--     (B) optional duplicate rows per target-list row for opp-level context (flagged).
+--
+-- Swap within 90 days: uses renewal rate close from latest renewal opp daily snap
+--   (same field as shelfware_impact_fy27_tableau.sql — adjust if your org uses another).
+--
+-- Tenant / signal drill-down: SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_TENANT_SHELFWARE
+--
+-- Shelfware metrics (baseline & current): same logic as shelf target / impact definition —
+--   sub_category from POV_WEIGHTED_SHELFWARE_TRENDING_VW → Sales & Service Cloud 50/50 split →
+--   group → join to product L1–L3 via CI_CH_FACT_ORDER_PROVISIONED_VALUE (drvd_product →
+--   hierarchy, CH_COVERED_FLG = 'Y') → allocate numerator/denominator/shelfware/pov/pov_at_risk
+--   by 1/map_count for 1:many drvd_product → L3 rows. Targets join on account_id_15 + L1–L3.
+--
+-- Reducing NULLs in exports:
+--   • Join renewals on full 18-char account + opportunity IDs (not 15-char prefixes).
+--   • Fallback account name from CI_DIM_ACCOUNT_VW when daily snap has no match.
+--   • UPPER(TRIM()) on L1–L3 when joining shelfware/CIDM to targets.
+--   • One APM/territory row per account (dedupe daily snap).
+--   • When renewal close date is null, use contract end date for rate-close context.
+--   • Shelfware still NULL when sub_category has no product_mapping row or L1–L3 ≠ target
+--     (shelfware_*_match = none); CIDM line metrics NULL when that L3 isn’t in provisioned fact.
+-- =============================================================================
+
+WITH
+shelfware_begin_snap AS (
+    SELECT COALESCE(
+        (SELECT MAX(sw.SNAPSHOT_DT)
+         FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW sw
+         WHERE sw.SNAPSHOT_DT = DATE '2025-01-31'),
+        (SELECT MAX(sw2.SNAPSHOT_DT)
+         FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW sw2
+         WHERE sw2.SNAPSHOT_DT <= DATE '2025-01-31')
+    ) AS begin_snap_date
+),
+
+shelfware_current_snap AS (
+    SELECT MAX(sw.SNAPSHOT_DT) AS current_snap_date
+    FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW sw
+    WHERE sw.SNAPSHOT_DT <= CURRENT_DATE()
+),
+
+custom_split_reallocation AS (
+    SELECT 'Sales and Service Cloud' AS sc_original, 'Sales Cloud'  AS sc_target, 0.5 AS pct_split
+    UNION ALL
+    SELECT 'Sales and Service Cloud' AS sc_original, 'Service Cloud' AS sc_target, 0.5 AS pct_split
+    UNION ALL
+    SELECT DISTINCT TRIM(v.SUB_CATEGORY) AS sc_original, TRIM(v.SUB_CATEGORY) AS sc_target, 1.0 AS pct_split
+    FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW v
+    WHERE v.SNAPSHOT_DT IN (
+        (SELECT begin_snap_date FROM shelfware_begin_snap),
+        (SELECT current_snap_date FROM shelfware_current_snap)
+    )
+      AND TRIM(v.SUB_CATEGORY) <> 'Sales and Service Cloud'
+),
+
+product_mapping AS (
+    SELECT
+        drvd_product_norm                                           AS sub_category,
+        drvd_prod_lvl_1,
+        drvd_prod_lvl_2,
+        drvd_prod_lvl_3,
+        COUNT(*) OVER (PARTITION BY drvd_product_norm)              AS map_count
+    FROM (
+        SELECT
+            CASE
+                WHEN TRIM(f.DRVD_PRODUCT) = 'Core Field Service' THEN 'Field Service'
+                ELSE TRIM(f.DRVD_PRODUCT)
+            END                                                     AS drvd_product_norm,
+            TRIM(f.DRVD_PROD_LVL_1)                                   AS drvd_prod_lvl_1,
+            TRIM(f.DRVD_PROD_LVL_2)                                   AS drvd_prod_lvl_2,
+            TRIM(f.DRVD_PROD_LVL_3)                                   AS drvd_prod_lvl_3
+        FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_CH_FACT_ORDER_PROVISIONED_VALUE f
+        WHERE f.CH_COVERED_FLG = 'Y'
+          AND f.SNAPSHOT_DT = (
+              SELECT MAX(f2.SNAPSHOT_DT)
+              FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_CH_FACT_ORDER_PROVISIONED_VALUE f2
+              WHERE f2.CH_COVERED_FLG = 'Y'
+          )
+        GROUP BY 1, 2, 3, 4
+    )
+),
+
+shelf_raw_bl AS (
+    SELECT
+        v.SNAPSHOT_DT                                               AS snapshot_dt,
+        TRIM(TO_VARCHAR(v.ACCOUNT_ID))                              AS account_id_15,
+        TRIM(v.SUB_CATEGORY)                                        AS sub_category,
+        v.IS_SELA                                                   AS is_sela,
+        v.SALES_OU                                                  AS sales_ou,
+        v.NUMERATOR                                                 AS numerator,
+        v.DENOMINATOR                                               AS denominator,
+        v.SHELFWARE                                                 AS shelfware,
+        v.POV                                                       AS pov,
+        v.POV_AT_RISK                                               AS pov_at_risk
+    FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW v
+    CROSS JOIN shelfware_begin_snap sbs
+    WHERE v.SNAPSHOT_DT = sbs.begin_snap_date
+),
+
+shelf_ss_split_bl AS (
+    SELECT
+        s.snapshot_dt,
+        s.account_id_15,
+        COALESCE(c.sc_target, s.sub_category)                       AS sub_category,
+        s.is_sela,
+        s.sales_ou,
+        s.numerator * COALESCE(c.pct_split, 1.0)                  AS numerator,
+        s.denominator * COALESCE(c.pct_split, 1.0)                AS denominator,
+        s.shelfware * COALESCE(c.pct_split, 1.0)                  AS shelfware,
+        s.pov * COALESCE(c.pct_split, 1.0)                        AS pov,
+        s.pov_at_risk * COALESCE(c.pct_split, 1.0)                AS pov_at_risk
+    FROM shelf_raw_bl s
+    LEFT JOIN custom_split_reallocation c
+        ON s.sub_category = c.sc_original
+),
+
+shelf_ss_grouped_bl AS (
+    SELECT
+        snapshot_dt,
+        account_id_15,
+        sub_category,
+        is_sela,
+        sales_ou,
+        SUM(numerator)                                             AS numerator,
+        SUM(denominator)                                           AS denominator,
+        SUM(shelfware)                                             AS shelfware,
+        SUM(pov)                                                   AS pov,
+        SUM(pov_at_risk)                                           AS pov_at_risk
+    FROM shelf_ss_split_bl
+    GROUP BY 1, 2, 3, 4, 5
+),
+
+shelf_by_prod_bl AS (
+    SELECT
+        g.snapshot_dt,
+        g.account_id_15,
+        g.is_sela,
+        g.sales_ou,
+        TRIM(pm.drvd_prod_lvl_1)                                   AS drvd_prod_lvl_1,
+        TRIM(pm.drvd_prod_lvl_2)                                   AS drvd_prod_lvl_2,
+        TRIM(pm.drvd_prod_lvl_3)                                   AS drvd_prod_lvl_3,
+        g.numerator / NULLIF(COALESCE(pm.map_count, 1), 0)       AS numerator,
+        g.denominator / NULLIF(COALESCE(pm.map_count, 1), 0)     AS denominator,
+        g.shelfware / NULLIF(COALESCE(pm.map_count, 1), 0)       AS shelfware,
+        g.pov / NULLIF(COALESCE(pm.map_count, 1), 0)             AS pov,
+        g.pov_at_risk / NULLIF(COALESCE(pm.map_count, 1), 0)     AS pov_at_risk,
+        SUM(g.pov) OVER (PARTITION BY g.snapshot_dt, g.account_id_15) AS account_pov_shelf
+    FROM shelf_ss_grouped_bl g
+    LEFT JOIN product_mapping pm
+        ON TRIM(g.sub_category) = TRIM(pm.sub_category)
+),
+
+shelf_raw_cur AS (
+    SELECT
+        v.SNAPSHOT_DT                                               AS snapshot_dt,
+        TRIM(TO_VARCHAR(v.ACCOUNT_ID))                              AS account_id_15,
+        TRIM(v.SUB_CATEGORY)                                        AS sub_category,
+        v.IS_SELA                                                   AS is_sela,
+        v.SALES_OU                                                  AS sales_ou,
+        v.NUMERATOR                                                 AS numerator,
+        v.DENOMINATOR                                               AS denominator,
+        v.SHELFWARE                                                 AS shelfware,
+        v.POV                                                       AS pov,
+        v.POV_AT_RISK                                               AS pov_at_risk
+    FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW v
+    CROSS JOIN shelfware_current_snap scs
+    WHERE v.SNAPSHOT_DT = scs.current_snap_date
+),
+
+shelf_ss_split_cur AS (
+    SELECT
+        s.snapshot_dt,
+        s.account_id_15,
+        COALESCE(c.sc_target, s.sub_category)                       AS sub_category,
+        s.is_sela,
+        s.sales_ou,
+        s.numerator * COALESCE(c.pct_split, 1.0)                  AS numerator,
+        s.denominator * COALESCE(c.pct_split, 1.0)                AS denominator,
+        s.shelfware * COALESCE(c.pct_split, 1.0)                  AS shelfware,
+        s.pov * COALESCE(c.pct_split, 1.0)                        AS pov,
+        s.pov_at_risk * COALESCE(c.pct_split, 1.0)                AS pov_at_risk
+    FROM shelf_raw_cur s
+    LEFT JOIN custom_split_reallocation c
+        ON s.sub_category = c.sc_original
+),
+
+shelf_ss_grouped_cur AS (
+    SELECT
+        snapshot_dt,
+        account_id_15,
+        sub_category,
+        is_sela,
+        sales_ou,
+        SUM(numerator)                                             AS numerator,
+        SUM(denominator)                                           AS denominator,
+        SUM(shelfware)                                             AS shelfware,
+        SUM(pov)                                                   AS pov,
+        SUM(pov_at_risk)                                           AS pov_at_risk
+    FROM shelf_ss_split_cur
+    GROUP BY 1, 2, 3, 4, 5
+),
+
+shelf_by_prod_cur AS (
+    SELECT
+        g.snapshot_dt,
+        g.account_id_15,
+        g.is_sela,
+        g.sales_ou,
+        TRIM(pm.drvd_prod_lvl_1)                                   AS drvd_prod_lvl_1,
+        TRIM(pm.drvd_prod_lvl_2)                                   AS drvd_prod_lvl_2,
+        TRIM(pm.drvd_prod_lvl_3)                                   AS drvd_prod_lvl_3,
+        g.numerator / NULLIF(COALESCE(pm.map_count, 1), 0)       AS numerator,
+        g.denominator / NULLIF(COALESCE(pm.map_count, 1), 0)     AS denominator,
+        g.shelfware / NULLIF(COALESCE(pm.map_count, 1), 0)       AS shelfware,
+        g.pov / NULLIF(COALESCE(pm.map_count, 1), 0)             AS pov,
+        g.pov_at_risk / NULLIF(COALESCE(pm.map_count, 1), 0)     AS pov_at_risk,
+        SUM(g.pov) OVER (PARTITION BY g.snapshot_dt, g.account_id_15) AS account_pov_shelf
+    FROM shelf_ss_grouped_cur g
+    LEFT JOIN product_mapping pm
+        ON TRIM(g.sub_category) = TRIM(pm.sub_category)
+),
+
+-- Only columns pulled from the target table (program, opty, account, L1–L3).
+targets_raw AS (
+    SELECT
+        UPPER(TRIM(tl.ACCOUNT_ID))                                AS account_id_norm,
+        SUBSTR(UPPER(TRIM(tl.ACCOUNT_ID)), 1, 15)                 AS account_id_15,
+        TRIM(tl.OPPORTUNITY_ID)                                   AS opportunity_id,
+        SUBSTR(TRIM(tl.OPPORTUNITY_ID), 1, 15)                    AS renewal_opty_id_15,
+        TRIM(tl.DRVD_PROD_L1)                                     AS DRVD_PROD_L1,
+        TRIM(tl.DRVD_PROD_L2)                                     AS DRVD_PROD_L2,
+        TRIM(tl.DRVD_PROD_L3)                                     AS DRVD_PROD_L3,
+        TRIM(tl.RD_PROGRAM)                                       AS program_name
+    FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+),
+
+renewal_opp_context AS (
+    SELECT
+        o.ACCT_ID                                                 AS account_id,
+        o.RENEWAL_OPTY_ID                                         AS opportunity_id,
+        o.ACCOUNT_NM                                              AS account_name,
+        o.GEO                                                     AS geo,
+        o.TEAM_TERRITORY                                          AS team_territory,
+        COALESCE(o.RENEWAL_CLSD_DT, o.RENEWAL_CONTRACT_END_DATE)  AS renewal_rate_close_dt,
+        o.RENEWAL_CONTRACT_END_DATE                               AS renewal_contract_end_date,
+        o.RENEWAL_FISCAL_QTR,
+        o.RENEWAL_FISCAL_YEAR,
+        o.RENEWAL_OPTY_NM,
+        o.RENEWAL_OPTY_OWNR_NM                                    AS renewal_opty_owner_nm,
+        o.RENEWAL_STG_NM                                          AS renewal_stage_nm,
+        o.RENEWAL_FCAST_CODE                                      AS renewal_fcast_code,
+        o.RENEWAL_STATUS                                          AS renewal_status,
+        o.SNAP_DATE                                               AS opp_context_snap_dt
+    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.CI_RENEWAL_OPTY_DAILY_SNAP_VW o
+    WHERE o.SNAP_DATE = (SELECT MAX(s.SNAP_DATE) FROM SSE_DM_CSG_RPT_PRD.RENEWALS.CI_RENEWAL_OPTY_DAILY_SNAP_VW s)
+),
+
+-- One territory row per account (daily snap has many opps per account).
+apm_hierarchy AS (
+    SELECT
+        UPPER(TRIM(o.ACCT_ID))                                     AS account_id_norm,
+        o.ACCOUNT_LVL_2_USR_NM                                     AS apm_l1,
+        o.ACCOUNT_LVL_3_USR_NM                                     AS apm_l2,
+        o.ACCOUNT_LVL_4_USR_NM                                     AS apm_l3,
+        o.CSG_TERRITORY,
+        o.CSG_AREA,
+        o.CSG_GEO,
+        o.CSG_PORTFOLIO
+    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.CI_RENEWAL_OPTY_DAILY_SNAP_VW o
+    WHERE o.SNAP_DATE = (SELECT MAX(s.SNAP_DATE) FROM SSE_DM_CSG_RPT_PRD.RENEWALS.CI_RENEWAL_OPTY_DAILY_SNAP_VW s)
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY UPPER(TRIM(o.ACCT_ID))
+        ORDER BY o.RENEWAL_OPTY_ID
+    ) = 1
+),
+
+-- Account name when renewal snap join fails (adjust ACCOUNT_NM if DESCRIBE shows a different column).
+account_dim AS (
+    SELECT
+        UPPER(TRIM(a.ACCOUNT_ID))                                  AS account_id_norm,
+        MAX(TRIM(a.ACCOUNT_NM))                                    AS account_name
+    FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_DIM_ACCOUNT_VW a
+    GROUP BY 1
+),
+
+targets_with_opp AS (
+    SELECT
+        tr.*,
+        roc.account_name,
+        roc.geo,
+        roc.renewal_rate_close_dt,
+        roc.RENEWAL_FISCAL_QTR,
+        roc.RENEWAL_FISCAL_YEAR,
+        roc.RENEWAL_OPTY_NM,
+        roc.renewal_opty_owner_nm,
+        roc.renewal_stage_nm,
+        roc.renewal_status
+    FROM targets_raw tr
+    LEFT JOIN renewal_opp_context roc
+        ON tr.account_id_norm = UPPER(TRIM(roc.account_id))
+        AND UPPER(TRIM(tr.opportunity_id)) = UPPER(TRIM(roc.opportunity_id))
+),
+
+-- Distinct program product lines (account × L1–L3) — use for non-duplicated shelfware / AOV
+target_product_lines AS (
+    SELECT
+        account_id_norm,
+        account_id_15,
+        DRVD_PROD_L1,
+        DRVD_PROD_L2,
+        DRVD_PROD_L3,
+        MAX(program_name)                                         AS program_name
+    FROM targets_raw
+    GROUP BY account_id_norm, account_id_15, DRVD_PROD_L1, DRVD_PROD_L2, DRVD_PROD_L3
+),
+
+line_opp_stats AS (
+    SELECT
+        account_id_norm,
+        DRVD_PROD_L1,
+        DRVD_PROD_L2,
+        DRVD_PROD_L3,
+        COUNT(DISTINCT opportunity_id)                            AS opp_count_for_line,
+        MIN(renewal_rate_close_dt)                                AS earliest_rate_close_dt,
+        MAX(renewal_rate_close_dt)                                AS latest_rate_close_dt
+    FROM targets_with_opp
+    GROUP BY account_id_norm, DRVD_PROD_L1, DRVD_PROD_L2, DRVD_PROD_L3
+),
+
+-- One "primary" opp per line for context columns (earliest rate close, then opty id)
+primary_opp_per_line AS (
+    SELECT
+        t.account_id_norm,
+        t.DRVD_PROD_L1,
+        t.DRVD_PROD_L2,
+        t.DRVD_PROD_L3,
+        t.opportunity_id,
+        t.renewal_rate_close_dt,
+        t.account_name,
+        t.geo,
+        t.RENEWAL_FISCAL_QTR,
+        t.RENEWAL_FISCAL_YEAR,
+        t.RENEWAL_OPTY_NM,
+        t.renewal_opty_owner_nm,
+        t.renewal_stage_nm,
+        t.renewal_status
+    FROM targets_with_opp t
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY t.account_id_norm, t.DRVD_PROD_L1, t.DRVD_PROD_L2, t.DRVD_PROD_L3
+        ORDER BY t.renewal_rate_close_dt NULLS LAST, t.opportunity_id
+    ) = 1
+),
+
+baseline_cidm AS (
+    SELECT
+        UPPER(TRIM(f.ACCOUNT_ID))                                 AS account_id_norm,
+        TRIM(f.DRVD_PROD_LVL_1)                                   AS DRVD_PROD_LVL_1,
+        TRIM(f.DRVD_PROD_LVL_2)                                   AS DRVD_PROD_LVL_2,
+        TRIM(f.DRVD_PROD_LVL_3)                                   AS DRVD_PROD_LVL_3,
+        SUM(f.ALLOC_AOV)                                          AS alloc_aov_baseline,
+        SUM(f.DRVD_CSS_ESTIMATED_PROVISIONED_ORDER_VALUE)         AS epov_baseline,
+        MAX(f.SNAPSHOT_DT)                                        AS baseline_snap_dt
+    FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_CH_FACT_ORDER_PROVISIONED_VALUE f
+    WHERE f.SNAPSHOT_DT = (
+        SELECT MAX(f2.SNAPSHOT_DT)
+        FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_CH_FACT_ORDER_PROVISIONED_VALUE f2
+        WHERE f2.SNAPSHOT_DT <= DATE '2025-01-31'
+    )
+    GROUP BY 1, 2, 3, 4
+),
+
+-- Account-level total AOV (all products): compare to line POV at risk for “mitigation” read.
+account_aov_baseline AS (
+    SELECT
+        UPPER(TRIM(f.ACCOUNT_ID))                                 AS account_id_norm,
+        SUM(f.ALLOC_AOV)                                          AS acct_total_aov_baseline
+    FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_CH_FACT_ORDER_PROVISIONED_VALUE f
+    WHERE f.SNAPSHOT_DT = (
+        SELECT MAX(f2.SNAPSHOT_DT)
+        FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_CH_FACT_ORDER_PROVISIONED_VALUE f2
+        WHERE f2.SNAPSHOT_DT <= DATE '2025-01-31'
+    )
+    GROUP BY 1
+),
+
+account_aov_current AS (
+    SELECT
+        UPPER(TRIM(f.ACCOUNT_ID))                                 AS account_id_norm,
+        SUM(f.ALLOC_AOV)                                          AS acct_total_aov_current
+    FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_CH_FACT_ORDER_PROVISIONED_VALUE f
+    WHERE f.CURR_SNAP = 'Y'
+    GROUP BY 1
+),
+
+current_cidm AS (
+    SELECT
+        UPPER(TRIM(f.ACCOUNT_ID))                                 AS account_id_norm,
+        TRIM(f.DRVD_PROD_LVL_1)                                   AS DRVD_PROD_LVL_1,
+        TRIM(f.DRVD_PROD_LVL_2)                                   AS DRVD_PROD_LVL_2,
+        TRIM(f.DRVD_PROD_LVL_3)                                   AS DRVD_PROD_LVL_3,
+        SUM(f.ALLOC_AOV)                                          AS alloc_aov_current,
+        SUM(f.DRVD_CSS_ESTIMATED_PROVISIONED_ORDER_VALUE)         AS epov_current,
+        MAX(f.SNAPSHOT_DT)                                        AS current_snap_dt
+    FROM SSE_DM_CSG_RPT_PRD.CIDM.CI_CH_FACT_ORDER_PROVISIONED_VALUE f
+    WHERE f.CURR_SNAP = 'Y'
+    GROUP BY 1, 2, 3, 4
+),
+
+product_current AS (
+    SELECT
+        p.ACCT_ID,
+        p.RENEWAL_OPTY_ID,
+        p.DRVD_PROD_LVL_1,
+        p.DRVD_PROD_LVL_2,
+        p.DRVD_PROD_LVL_3,
+        p.AOV                                                     AS current_line_aov,
+        p.SALES_OU                                                AS sales_ou,
+        p.ETL_REFRESH_DATE                                        AS product_snap_dt
+    FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.RENEWALS_PRODUCT_OPEN_CLOSED p
+    WHERE p.ETL_REFRESH_DATE = (
+        SELECT MAX(p2.ETL_REFRESH_DATE)
+        FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.RENEWALS_PRODUCT_OPEN_CLOSED p2
+    )
+),
+
+top_other_product_on_opp AS (
+    SELECT
+        tg.account_id_norm,
+        tg.opportunity_id,
+        tg.DRVD_PROD_L1                                           AS tgt_l1,
+        tg.DRVD_PROD_L2                                           AS tgt_l2,
+        tg.DRVD_PROD_L3                                           AS tgt_l3,
+        p.DRVD_PROD_LVL_1                                         AS swapped_in_l1,
+        p.DRVD_PROD_LVL_2                                         AS swapped_in_l2,
+        p.DRVD_PROD_LVL_3                                         AS swapped_in_l3,
+        p.current_line_aov                                        AS swapped_line_aov
+    FROM targets_raw tg
+    INNER JOIN product_current p
+        ON tg.account_id_norm = UPPER(TRIM(p.ACCT_ID))
+        AND UPPER(TRIM(tg.opportunity_id)) = UPPER(TRIM(p.RENEWAL_OPTY_ID))
+        AND NOT (
+                COALESCE(UPPER(TRIM(p.DRVD_PROD_LVL_1)), '') = COALESCE(UPPER(TRIM(tg.DRVD_PROD_L1)), '')
+            AND COALESCE(UPPER(TRIM(p.DRVD_PROD_LVL_2)), '') = COALESCE(UPPER(TRIM(tg.DRVD_PROD_L2)), '')
+            AND COALESCE(UPPER(TRIM(p.DRVD_PROD_LVL_3)), '') = COALESCE(UPPER(TRIM(tg.DRVD_PROD_L3)), '')
+        )
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY tg.account_id_norm, tg.opportunity_id, tg.DRVD_PROD_L1, tg.DRVD_PROD_L2, tg.DRVD_PROD_L3
+        ORDER BY p.current_line_aov DESC NULLS LAST
+    ) = 1
+)
+
+-- =========  (A) Deduped grain: account × target product line — use for portfolio totals  =========
+SELECT
+    'line_grain_deduped'                                          AS report_row_type,
+    (SELECT begin_snap_date FROM shelfware_begin_snap)            AS baseline_snapshot_date,
+    (SELECT current_snap_date FROM shelfware_current_snap)        AS current_snapshot_date,
+    tpl.account_id_norm                                           AS acct_id,
+    COALESCE(popl.account_name, ad.account_name)                  AS acc_name,
+    popl.geo,
+    h.CSG_TERRITORY                                               AS csg_territory,
+    h.CSG_GEO                                                     AS csg_geo,
+    h.CSG_AREA                                                    AS csg_area,
+    popl.renewal_stage_nm                                         AS stage,
+    popl.renewal_status                                           AS status,
+    popl.RENEWAL_FISCAL_QTR                                       AS renewal_fiscal_qtr,
+    popl.RENEWAL_FISCAL_YEAR                                      AS renewal_fiscal_year,
+    tpl.program_name                                              AS program_name,
+    popl.opportunity_id                                           AS primary_opportunity_id_for_line,
+    los.opp_count_for_line,
+    los.earliest_rate_close_dt,
+    los.latest_rate_close_dt,
+    popl.renewal_rate_close_dt                                    AS primary_renewal_rate_close_dt,
+    tpl.DRVD_PROD_L1                                              AS drvd_prod_l1,
+    tpl.DRVD_PROD_L2                                              AS drvd_prod_l2,
+    tpl.DRVD_PROD_L3                                              AS drvd_prod_l3,
+
+    bc.alloc_aov_baseline                                         AS baseline_aov,
+    bc.epov_baseline                                              AS baseline_epov,
+    bsm.pov_at_risk                                               AS baseline_pov_at_risk,
+    bsm.numerator                                                 AS baseline_numerator,
+    bsm.denominator                                               AS baseline_denominator,
+    bsm.shelfware                                                 AS baseline_shelfware,
+    bsm.pov                                                       AS baseline_shelf_pov_l3,
+
+    cc.alloc_aov_current                                          AS current_aov,
+    cc.epov_current                                               AS current_epov,
+    csm.pov_at_risk                                               AS current_pov_at_risk,
+    csm.numerator                                                 AS current_numerator,
+    csm.denominator                                               AS current_denominator,
+    csm.shelfware                                                 AS current_shelfware,
+    csm.pov                                                       AS current_shelf_pov_l3,
+
+    CASE WHEN bsm.account_id_15 IS NOT NULL THEN 'split_subcat_mapped_l123' ELSE 'none' END
+                                                                  AS shelfware_baseline_match,
+    CASE WHEN csm.account_id_15 IS NOT NULL THEN 'split_subcat_mapped_l123' ELSE 'none' END
+                                                                  AS shelfware_current_match,
+
+    cc.alloc_aov_current - bc.alloc_aov_baseline                  AS aov_change,
+    cc.epov_current - bc.epov_baseline                            AS epov_change,
+    csm.pov_at_risk - bsm.pov_at_risk                             AS pov_at_risk_delta,
+
+    aab.acct_total_aov_baseline                                   AS account_total_aov_baseline,
+    aac.acct_total_aov_current                                    AS account_total_aov_current,
+    aac.acct_total_aov_current - aab.acct_total_aov_baseline      AS account_total_aov_delta,
+
+    CASE
+        WHEN bsm.pov_at_risk IS NULL OR bsm.pov_at_risk = 0 THEN NULL
+        ELSE (cc.epov_current - bc.epov_baseline) >= bsm.pov_at_risk
+    END                                                           AS epov_change_covers_baseline_pov_at_risk,
+
+    CASE
+        WHEN bsm.pov_at_risk IS NULL OR bsm.pov_at_risk = 0 THEN NULL
+        ELSE (aac.acct_total_aov_current - aab.acct_total_aov_baseline) >= bsm.pov_at_risk
+    END                                                           AS account_total_aov_delta_covers_baseline_line_pov_at_risk,
+
+    CAST(NULL AS BOOLEAN)                                         AS swap_detected_target_l3,
+    CAST(NULL AS BOOLEAN)                                         AS swap_within_90d_pre_rate_close,
+    CAST(NULL AS VARCHAR)                                         AS swapped_product,
+    CAST(NULL AS VARCHAR)                                         AS sales_ou,
+    CAST(NULL AS VARCHAR)                                         AS opportunity_id_all_targets,
+    1                                                             AS shelfware_metrics_weight
+
+FROM target_product_lines tpl
+LEFT JOIN primary_opp_per_line popl
+    ON tpl.account_id_norm = popl.account_id_norm
+    AND tpl.DRVD_PROD_L1 = popl.DRVD_PROD_L1
+    AND tpl.DRVD_PROD_L2 = popl.DRVD_PROD_L2
+    AND tpl.DRVD_PROD_L3 = popl.DRVD_PROD_L3
+LEFT JOIN line_opp_stats los
+    ON tpl.account_id_norm = los.account_id_norm
+    AND tpl.DRVD_PROD_L1 = los.DRVD_PROD_L1
+    AND tpl.DRVD_PROD_L2 = los.DRVD_PROD_L2
+    AND tpl.DRVD_PROD_L3 = los.DRVD_PROD_L3
+LEFT JOIN account_dim ad
+    ON tpl.account_id_norm = ad.account_id_norm
+LEFT JOIN apm_hierarchy h
+    ON tpl.account_id_norm = h.account_id_norm
+LEFT JOIN baseline_cidm bc
+    ON tpl.account_id_norm = bc.account_id_norm
+    AND UPPER(TRIM(tpl.DRVD_PROD_L1)) = UPPER(TRIM(bc.DRVD_PROD_LVL_1))
+    AND UPPER(TRIM(tpl.DRVD_PROD_L2)) = UPPER(TRIM(bc.DRVD_PROD_LVL_2))
+    AND UPPER(TRIM(tpl.DRVD_PROD_L3)) = UPPER(TRIM(bc.DRVD_PROD_LVL_3))
+LEFT JOIN current_cidm cc
+    ON tpl.account_id_norm = cc.account_id_norm
+    AND UPPER(TRIM(tpl.DRVD_PROD_L1)) = UPPER(TRIM(cc.DRVD_PROD_LVL_1))
+    AND UPPER(TRIM(tpl.DRVD_PROD_L2)) = UPPER(TRIM(cc.DRVD_PROD_LVL_2))
+    AND UPPER(TRIM(tpl.DRVD_PROD_L3)) = UPPER(TRIM(cc.DRVD_PROD_LVL_3))
+LEFT JOIN account_aov_baseline aab
+    ON tpl.account_id_norm = aab.account_id_norm
+LEFT JOIN account_aov_current aac
+    ON tpl.account_id_norm = aac.account_id_norm
+LEFT JOIN shelf_by_prod_bl bsm
+    ON tpl.account_id_15 = bsm.account_id_15
+    AND UPPER(TRIM(tpl.DRVD_PROD_L1)) = UPPER(TRIM(bsm.drvd_prod_lvl_1))
+    AND UPPER(TRIM(tpl.DRVD_PROD_L2)) = UPPER(TRIM(bsm.drvd_prod_lvl_2))
+    AND UPPER(TRIM(tpl.DRVD_PROD_L3)) = UPPER(TRIM(bsm.drvd_prod_lvl_3))
+LEFT JOIN shelf_by_prod_cur csm
+    ON tpl.account_id_15 = csm.account_id_15
+    AND UPPER(TRIM(tpl.DRVD_PROD_L1)) = UPPER(TRIM(csm.drvd_prod_lvl_1))
+    AND UPPER(TRIM(tpl.DRVD_PROD_L2)) = UPPER(TRIM(csm.drvd_prod_lvl_2))
+    AND UPPER(TRIM(tpl.DRVD_PROD_L3)) = UPPER(TRIM(csm.drvd_prod_lvl_3))
+
+UNION ALL
+
+-- =========  (B) Target-list grain: one row per target opp × product (swap fields populated;
+--      shelfware duplicated if same line on multiple opps — use shelfware_metrics_weight = 1/opp_count
+--      in Tableau or use section A for sums)  =========
+SELECT
+    'target_list_grain'                                           AS report_row_type,
+    (SELECT begin_snap_date FROM shelfware_begin_snap)            AS baseline_snapshot_date,
+    (SELECT current_snap_date FROM shelfware_current_snap)        AS current_snapshot_date,
+    t.account_id_norm                                             AS acct_id,
+    COALESCE(roc.account_name, ad.account_name)                   AS acc_name,
+    roc.geo,
+    h.CSG_TERRITORY                                               AS csg_territory,
+    h.CSG_GEO                                                     AS csg_geo,
+    h.CSG_AREA                                                    AS csg_area,
+    roc.renewal_stage_nm                                          AS stage,
+    roc.renewal_status                                            AS status,
+    roc.RENEWAL_FISCAL_QTR                                        AS renewal_fiscal_qtr,
+    roc.RENEWAL_FISCAL_YEAR                                       AS renewal_fiscal_year,
+    t.program_name                                                AS program_name,
+    t.opportunity_id                                              AS primary_opportunity_id_for_line,
+    los.opp_count_for_line,
+    los.earliest_rate_close_dt,
+    los.latest_rate_close_dt,
+    roc.renewal_rate_close_dt                                     AS primary_renewal_rate_close_dt,
+    t.DRVD_PROD_L1                                                AS drvd_prod_l1,
+    t.DRVD_PROD_L2                                                AS drvd_prod_l2,
+    t.DRVD_PROD_L3                                                AS drvd_prod_l3,
+
+    bc.alloc_aov_baseline                                         AS baseline_aov,
+    bc.epov_baseline                                              AS baseline_epov,
+    bsm.pov_at_risk                                               AS baseline_pov_at_risk,
+    bsm.numerator                                                 AS baseline_numerator,
+    bsm.denominator                                               AS baseline_denominator,
+    bsm.shelfware                                                 AS baseline_shelfware,
+    bsm.pov                                                       AS baseline_shelf_pov_l3,
+
+    cc.alloc_aov_current                                          AS current_aov,
+    cc.epov_current                                               AS current_epov,
+    csm.pov_at_risk                                               AS current_pov_at_risk,
+    csm.numerator                                                 AS current_numerator,
+    csm.denominator                                               AS current_denominator,
+    csm.shelfware                                                 AS current_shelfware,
+    csm.pov                                                       AS current_shelf_pov_l3,
+
+    CASE WHEN bsm.account_id_15 IS NOT NULL THEN 'split_subcat_mapped_l123' ELSE 'none' END
+                                                                  AS shelfware_baseline_match,
+    CASE WHEN csm.account_id_15 IS NOT NULL THEN 'split_subcat_mapped_l123' ELSE 'none' END
+                                                                  AS shelfware_current_match,
+
+    cc.alloc_aov_current - bc.alloc_aov_baseline                  AS aov_change,
+    cc.epov_current - bc.epov_baseline                            AS epov_change,
+    csm.pov_at_risk - bsm.pov_at_risk                             AS pov_at_risk_delta,
+
+    aab.acct_total_aov_baseline                                   AS account_total_aov_baseline,
+    aac.acct_total_aov_current                                    AS account_total_aov_current,
+    aac.acct_total_aov_current - aab.acct_total_aov_baseline      AS account_total_aov_delta,
+
+    CASE
+        WHEN bsm.pov_at_risk IS NULL OR bsm.pov_at_risk = 0 THEN NULL
+        ELSE (cc.epov_current - bc.epov_baseline) >= bsm.pov_at_risk
+    END                                                           AS epov_change_covers_baseline_pov_at_risk,
+
+    CASE
+        WHEN bsm.pov_at_risk IS NULL OR bsm.pov_at_risk = 0 THEN NULL
+        ELSE (aac.acct_total_aov_current - aab.acct_total_aov_baseline) >= bsm.pov_at_risk
+    END                                                           AS account_total_aov_delta_covers_baseline_line_pov_at_risk,
+
+    CASE
+        WHEN pc.current_line_aov IS NULL THEN TRUE
+        WHEN IFNULL(pc.current_line_aov, 0) < IFNULL(bc.alloc_aov_baseline, 0) THEN TRUE
+        ELSE FALSE
+    END                                                           AS swap_detected_target_l3,
+
+    CASE
+        WHEN roc.renewal_rate_close_dt IS NULL THEN NULL
+        WHEN CURRENT_DATE() BETWEEN DATEADD(day, -90, roc.renewal_rate_close_dt)
+                                AND roc.renewal_rate_close_dt
+         AND (
+                pc.current_line_aov IS NULL
+                OR IFNULL(pc.current_line_aov, 0) < IFNULL(bc.alloc_aov_baseline, 0)
+            )
+        THEN TRUE
+        ELSE FALSE
+    END                                                           AS swap_within_90d_pre_rate_close,
+
+    CASE
+        WHEN pc.current_line_aov IS NULL
+            OR IFNULL(pc.current_line_aov, 0) < IFNULL(bc.alloc_aov_baseline, 0)
+        THEN CONCAT_WS(' / ', spo.swapped_in_l1, spo.swapped_in_l2, spo.swapped_in_l3)
+        ELSE NULL
+    END                                                           AS swapped_product,
+
+    pc.sales_ou,
+    t.opportunity_id                                              AS opportunity_id_all_targets,
+    DIV0(1, NULLIF(los.opp_count_for_line, 0))                    AS shelfware_metrics_weight
+
+FROM targets_raw t
+LEFT JOIN renewal_opp_context roc
+    ON t.account_id_norm = UPPER(TRIM(roc.account_id))
+    AND UPPER(TRIM(t.opportunity_id)) = UPPER(TRIM(roc.opportunity_id))
+LEFT JOIN line_opp_stats los
+    ON t.account_id_norm = los.account_id_norm
+    AND t.DRVD_PROD_L1 = los.DRVD_PROD_L1
+    AND t.DRVD_PROD_L2 = los.DRVD_PROD_L2
+    AND t.DRVD_PROD_L3 = los.DRVD_PROD_L3
+LEFT JOIN account_dim ad
+    ON t.account_id_norm = ad.account_id_norm
+LEFT JOIN apm_hierarchy h
+    ON t.account_id_norm = h.account_id_norm
+LEFT JOIN baseline_cidm bc
+    ON t.account_id_norm = bc.account_id_norm
+    AND UPPER(TRIM(t.DRVD_PROD_L1)) = UPPER(TRIM(bc.DRVD_PROD_LVL_1))
+    AND UPPER(TRIM(t.DRVD_PROD_L2)) = UPPER(TRIM(bc.DRVD_PROD_LVL_2))
+    AND UPPER(TRIM(t.DRVD_PROD_L3)) = UPPER(TRIM(bc.DRVD_PROD_LVL_3))
+LEFT JOIN current_cidm cc
+    ON t.account_id_norm = cc.account_id_norm
+    AND UPPER(TRIM(t.DRVD_PROD_L1)) = UPPER(TRIM(cc.DRVD_PROD_LVL_1))
+    AND UPPER(TRIM(t.DRVD_PROD_L2)) = UPPER(TRIM(cc.DRVD_PROD_LVL_2))
+    AND UPPER(TRIM(t.DRVD_PROD_L3)) = UPPER(TRIM(cc.DRVD_PROD_LVL_3))
+LEFT JOIN account_aov_baseline aab
+    ON t.account_id_norm = aab.account_id_norm
+LEFT JOIN account_aov_current aac
+    ON t.account_id_norm = aac.account_id_norm
+LEFT JOIN shelf_by_prod_bl bsm
+    ON t.account_id_15 = bsm.account_id_15
+    AND UPPER(TRIM(t.DRVD_PROD_L1)) = UPPER(TRIM(bsm.drvd_prod_lvl_1))
+    AND UPPER(TRIM(t.DRVD_PROD_L2)) = UPPER(TRIM(bsm.drvd_prod_lvl_2))
+    AND UPPER(TRIM(t.DRVD_PROD_L3)) = UPPER(TRIM(bsm.drvd_prod_lvl_3))
+LEFT JOIN shelf_by_prod_cur csm
+    ON t.account_id_15 = csm.account_id_15
+    AND UPPER(TRIM(t.DRVD_PROD_L1)) = UPPER(TRIM(csm.drvd_prod_lvl_1))
+    AND UPPER(TRIM(t.DRVD_PROD_L2)) = UPPER(TRIM(csm.drvd_prod_lvl_2))
+    AND UPPER(TRIM(t.DRVD_PROD_L3)) = UPPER(TRIM(csm.drvd_prod_lvl_3))
+LEFT JOIN product_current pc
+    ON t.account_id_norm = UPPER(TRIM(pc.ACCT_ID))
+    AND UPPER(TRIM(t.opportunity_id)) = UPPER(TRIM(pc.RENEWAL_OPTY_ID))
+    AND UPPER(TRIM(t.DRVD_PROD_L1)) = UPPER(TRIM(pc.DRVD_PROD_LVL_1))
+    AND UPPER(TRIM(t.DRVD_PROD_L2)) = UPPER(TRIM(pc.DRVD_PROD_LVL_2))
+    AND UPPER(TRIM(t.DRVD_PROD_L3)) = UPPER(TRIM(pc.DRVD_PROD_LVL_3))
+LEFT JOIN top_other_product_on_opp spo
+    ON t.account_id_norm = spo.account_id_norm
+    AND UPPER(TRIM(t.opportunity_id)) = UPPER(TRIM(spo.opportunity_id))
+    AND UPPER(TRIM(t.DRVD_PROD_L1)) = UPPER(TRIM(spo.tgt_l1))
+    AND UPPER(TRIM(t.DRVD_PROD_L2)) = UPPER(TRIM(spo.tgt_l2))
+    AND UPPER(TRIM(t.DRVD_PROD_L3)) = UPPER(TRIM(spo.tgt_l3))
+
+ORDER BY
+    report_row_type,
+    acct_id,
+    drvd_prod_l1,
+    drvd_prod_l2,
+    drvd_prod_l3,
+    primary_opportunity_id_for_line;
