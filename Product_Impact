@@ -1,0 +1,765 @@
+/* =============================================================================
+   Shelfware trending + FY27 target list
+   - Baseline vs latest snapshots (edit params)
+   - Swap pattern: from_line (POV>0 -> 0) + to_line; by default to_line_for_swap keeps only
+     Mar_only destinations (grain absent on baseline, POV>0 on latest) — "product not there before."
+     Set require_dest_absent_in_baseline = FALSE to also allow Both_months (0 -> >0 POV on same grain).
+   - Agentforce: sub_category = 'Agentforce' (confirm in DESC VIEW)
+   - Query (4): all-product swap dashboard row per account (optional from_subcategory_filter).
+   - "Swapped to" product = sub_category / sub_capability / custom_l1 on a to_line;
+     new POV on latest snapshot: query (1) last column swapped_to_new_pov_usd only; see (3) for detail rows.
+   ============================================================================= */
+
+/*------------------------------------------------------------------------------
+  1) CUSTOMER LIST — accounts with swap-from-Agentforce + metrics
+------------------------------------------------------------------------------*/
+WITH params AS (
+  SELECT
+    DATE '2026-01-01' AS dt_baseline,
+    DATE '2026-03-01' AS dt_latest,
+    /* TRUE: only destinations with no baseline row (Mar_only + POV>0 on latest).
+       FALSE: also allow Both_months where baseline POV was 0 and latest POV > 0. */
+    TRUE AS require_dest_absent_in_baseline
+),
+
+target_accounts AS (
+  SELECT DISTINCT tl.account_id AS account_id
+  FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+  WHERE tl.account_id IS NOT NULL
+),
+
+trending AS (
+  SELECT
+    t.account_id,
+    t.sub_category,
+    t.sub_capability,
+    t.custom_l1,
+    t.snapshot_dt::DATE AS snapshot_dt,
+    t.shelfware,
+    t.pov,
+    t.pov_at_risk
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+  INNER JOIN target_accounts ta ON t.account_id = ta.account_id
+  CROSS JOIN params p
+  WHERE t.snapshot_dt::DATE IN (p.dt_baseline, p.dt_latest)
+),
+
+baseline AS (
+  SELECT t.*
+  FROM trending t
+  CROSS JOIN params p
+  WHERE t.snapshot_dt = p.dt_baseline
+),
+
+latest AS (
+  SELECT t.*
+  FROM trending t
+  CROSS JOIN params p
+  WHERE t.snapshot_dt = p.dt_latest
+),
+
+detail AS (
+  SELECT
+    COALESCE(b.account_id, l.account_id) AS account_id,
+    COALESCE(b.sub_category, l.sub_category) AS sub_category,
+    COALESCE(b.sub_capability, l.sub_capability) AS sub_capability,
+    COALESCE(b.custom_l1, l.custom_l1) AS custom_l1,
+    b.shelfware AS shelfware_baseline,
+    l.shelfware AS shelfware_latest,
+    b.pov AS pov_baseline,
+    l.pov AS pov_latest,
+    b.pov_at_risk AS pov_at_risk_baseline,
+    l.pov_at_risk AS pov_at_risk_latest,
+    CASE
+      WHEN b.account_id IS NULL THEN 'Mar_only'
+      WHEN l.account_id IS NULL THEN 'Jan_only'
+      ELSE 'Both_months'
+    END AS period_coverage
+  FROM baseline b
+  FULL OUTER JOIN latest l
+    ON b.account_id = l.account_id
+   AND EQUAL_NULL(b.sub_category, l.sub_category)
+   AND EQUAL_NULL(b.sub_capability, l.sub_capability)
+   AND EQUAL_NULL(b.custom_l1, l.custom_l1)
+),
+
+from_line AS (
+  SELECT *
+  FROM detail
+  WHERE period_coverage = 'Both_months'
+    AND ZEROIFNULL(pov_baseline) > 0
+    AND ZEROIFNULL(pov_latest) = 0
+),
+
+to_line AS (
+  SELECT *
+  FROM detail
+  WHERE (period_coverage = 'Both_months'
+         AND ZEROIFNULL(pov_baseline) = 0
+         AND ZEROIFNULL(pov_latest) > 0)
+     OR (period_coverage = 'Mar_only'
+         AND ZEROIFNULL(pov_latest) > 0)
+),
+
+to_line_for_swap AS (
+  SELECT t.*
+  FROM to_line t
+  CROSS JOIN params p
+  WHERE NOT p.require_dest_absent_in_baseline
+     OR t.period_coverage = 'Mar_only'
+),
+
+swap_accounts AS (
+  SELECT DISTINCT f.account_id
+  FROM from_line f
+  WHERE EXISTS (SELECT 1 FROM to_line_for_swap t WHERE t.account_id = f.account_id)
+),
+
+from_af AS (
+  SELECT f.*
+  FROM from_line f
+  INNER JOIN swap_accounts s ON s.account_id = f.account_id
+  WHERE f.sub_category = 'Agentforce'
+),
+
+af_pov_by_acct AS (
+  SELECT
+    d.account_id,
+    SUM(IFF(d.sub_category = 'Agentforce'
+           AND d.period_coverage IN ('Both_months', 'Jan_only'),
+           ZEROIFNULL(d.pov_baseline), 0)) AS pov_jan_af_sum,
+    SUM(IFF(d.sub_category = 'Agentforce'
+           AND d.period_coverage IN ('Both_months', 'Mar_only'),
+           ZEROIFNULL(d.pov_latest), 0)) AS pov_mar_af_sum
+  FROM detail d
+  GROUP BY 1
+),
+
+account_swap_from_af AS (
+  SELECT
+    f.account_id,
+    SUM(ZEROIFNULL(f.pov_baseline)) AS pov_swapped_off_af_lines,
+    SUM(ZEROIFNULL(f.shelfware_baseline)) AS shelfware_on_af_from_lines_baseline,
+    COUNT(*) AS af_from_line_cnt
+  FROM from_af f
+  GROUP BY 1
+),
+
+/* Destination lines = to_line_for_swap on same account as swap-from-AF, excluding the exact AF
+   lines that went to zero (same grain). new_pov = POV on dt_latest for that line. */
+to_destination AS (
+  SELECT
+    t.account_id,
+    t.sub_category,
+    t.sub_capability,
+    t.custom_l1,
+    MAX(ZEROIFNULL(t.pov_latest)) AS new_pov,
+    MAX(ZEROIFNULL(t.shelfware_latest)) AS new_shelfware,
+    MAX(t.period_coverage) AS to_line_period_coverage
+  FROM to_line_for_swap t
+  INNER JOIN (SELECT DISTINCT account_id FROM from_af) x ON x.account_id = t.account_id
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM from_af ff
+    WHERE ff.account_id = t.account_id
+      AND EQUAL_NULL(ff.sub_category, t.sub_category)
+      AND EQUAL_NULL(ff.sub_capability, t.sub_capability)
+      AND EQUAL_NULL(ff.custom_l1, t.custom_l1)
+  )
+  GROUP BY 1, 2, 3, 4
+),
+
+to_products AS (
+  SELECT
+    account_id,
+    LISTAGG(
+      sub_category || ' / ' || COALESCE(sub_capability, '') || ' / ' || COALESCE(custom_l1, ''),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY sub_category, sub_capability, custom_l1
+    ) AS swapped_to_products,
+    /* Same row order as swapped_to_products; values only (POV $ on latest snapshot per line). */
+    LISTAGG(
+      '$' || TO_VARCHAR(ROUND(new_pov, 2)),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY sub_category, sub_capability, custom_l1
+    ) AS swapped_to_new_pov_usd
+  FROM to_destination
+  GROUP BY account_id
+)
+
+SELECT
+  p.dt_baseline AS snapshot_baseline,
+  p.dt_latest AS snapshot_latest,
+  a.account_id,
+  z.pov_jan_af_sum,
+  z.pov_mar_af_sum,
+  CASE
+    WHEN z.pov_jan_af_sum > 0 AND z.pov_mar_af_sum = 0 THEN 'Full_exit'
+    WHEN z.pov_jan_af_sum > 0
+         AND z.pov_mar_af_sum > 0
+         AND z.pov_mar_af_sum < z.pov_jan_af_sum THEN 'Partial_exit'
+    WHEN z.pov_jan_af_sum > 0 AND z.pov_mar_af_sum >= z.pov_jan_af_sum THEN 'No_reduction_or_increase'
+    ELSE 'No_jan_af_pov'
+  END AS af_pov_exit_type,
+  a.pov_swapped_off_af_lines,
+  a.shelfware_on_af_from_lines_baseline,
+  a.af_from_line_cnt,
+  tp.swapped_to_products,
+  tp.swapped_to_new_pov_usd
+FROM account_swap_from_af a
+CROSS JOIN params p
+LEFT JOIN af_pov_by_acct z ON z.account_id = a.account_id
+LEFT JOIN to_products tp ON tp.account_id = a.account_id
+ORDER BY a.pov_swapped_off_af_lines DESC NULLS LAST;
+
+/*------------------------------------------------------------------------------
+  2) SUMMARY KPIs — same logic, one rollup row
+------------------------------------------------------------------------------*/
+WITH params AS (
+  SELECT
+    DATE '2026-01-01' AS dt_baseline,
+    DATE '2026-03-01' AS dt_latest,
+    TRUE AS require_dest_absent_in_baseline
+),
+target_accounts AS (
+  SELECT DISTINCT tl.account_id AS account_id
+  FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+  WHERE tl.account_id IS NOT NULL
+),
+trending AS (
+  SELECT
+    t.account_id,
+    t.sub_category,
+    t.sub_capability,
+    t.custom_l1,
+    t.snapshot_dt::DATE AS snapshot_dt,
+    t.shelfware,
+    t.pov,
+    t.pov_at_risk
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+  INNER JOIN target_accounts ta ON t.account_id = ta.account_id
+  CROSS JOIN params p
+  WHERE t.snapshot_dt::DATE IN (p.dt_baseline, p.dt_latest)
+),
+baseline AS (
+  SELECT t.* FROM trending t CROSS JOIN params p WHERE t.snapshot_dt = p.dt_baseline
+),
+latest AS (
+  SELECT t.* FROM trending t CROSS JOIN params p WHERE t.snapshot_dt = p.dt_latest
+),
+detail AS (
+  SELECT
+    COALESCE(b.account_id, l.account_id) AS account_id,
+    COALESCE(b.sub_category, l.sub_category) AS sub_category,
+    COALESCE(b.sub_capability, l.sub_capability) AS sub_capability,
+    COALESCE(b.custom_l1, l.custom_l1) AS custom_l1,
+    b.shelfware AS shelfware_baseline,
+    l.shelfware AS shelfware_latest,
+    b.pov AS pov_baseline,
+    l.pov AS pov_latest,
+    CASE
+      WHEN b.account_id IS NULL THEN 'Mar_only'
+      WHEN l.account_id IS NULL THEN 'Jan_only'
+      ELSE 'Both_months'
+    END AS period_coverage
+  FROM baseline b
+  FULL OUTER JOIN latest l
+    ON b.account_id = l.account_id
+   AND EQUAL_NULL(b.sub_category, l.sub_category)
+   AND EQUAL_NULL(b.sub_capability, l.sub_capability)
+   AND EQUAL_NULL(b.custom_l1, l.custom_l1)
+),
+from_line AS (
+  SELECT * FROM detail
+  WHERE period_coverage = 'Both_months'
+    AND ZEROIFNULL(pov_baseline) > 0
+    AND ZEROIFNULL(pov_latest) = 0
+),
+to_line AS (
+  SELECT * FROM detail
+  WHERE (period_coverage = 'Both_months'
+         AND ZEROIFNULL(pov_baseline) = 0
+         AND ZEROIFNULL(pov_latest) > 0)
+     OR (period_coverage = 'Mar_only' AND ZEROIFNULL(pov_latest) > 0)
+),
+to_line_for_swap AS (
+  SELECT t.*
+  FROM to_line t
+  CROSS JOIN params p
+  WHERE NOT p.require_dest_absent_in_baseline
+     OR t.period_coverage = 'Mar_only'
+),
+swap_accounts AS (
+  SELECT DISTINCT f.account_id
+  FROM from_line f
+  WHERE EXISTS (SELECT 1 FROM to_line_for_swap t WHERE t.account_id = f.account_id)
+),
+from_af AS (
+  SELECT f.* FROM from_line f
+  INNER JOIN swap_accounts s ON s.account_id = f.account_id
+  WHERE f.sub_category = 'Agentforce'
+),
+af_pov_by_acct AS (
+  SELECT
+    d.account_id,
+    SUM(IFF(d.sub_category = 'Agentforce'
+           AND d.period_coverage IN ('Both_months', 'Jan_only'),
+           ZEROIFNULL(d.pov_baseline), 0)) AS pov_jan_af_sum,
+    SUM(IFF(d.sub_category = 'Agentforce'
+           AND d.period_coverage IN ('Both_months', 'Mar_only'),
+           ZEROIFNULL(d.pov_latest), 0)) AS pov_mar_af_sum
+  FROM detail d
+  GROUP BY 1
+),
+account_swap_from_af AS (
+  SELECT f.account_id,
+    SUM(ZEROIFNULL(f.pov_baseline)) AS pov_swapped_off_af_lines,
+    SUM(ZEROIFNULL(f.shelfware_baseline)) AS shelfware_on_af_from_lines_baseline
+  FROM from_af f
+  GROUP BY 1
+),
+acct_classified AS (
+  SELECT
+    a.account_id,
+    a.pov_swapped_off_af_lines,
+    a.shelfware_on_af_from_lines_baseline,
+    z.pov_jan_af_sum,
+    z.pov_mar_af_sum,
+    CASE
+      WHEN z.pov_jan_af_sum > 0 AND z.pov_mar_af_sum = 0 THEN 'Full_exit'
+      WHEN z.pov_jan_af_sum > 0
+           AND z.pov_mar_af_sum > 0
+           AND z.pov_mar_af_sum < z.pov_jan_af_sum THEN 'Partial_exit'
+      WHEN z.pov_jan_af_sum > 0 AND z.pov_mar_af_sum >= z.pov_jan_af_sum THEN 'No_reduction_or_increase'
+      ELSE 'No_jan_af_pov'
+    END AS af_pov_exit_type
+  FROM account_swap_from_af a
+  LEFT JOIN af_pov_by_acct z ON z.account_id = a.account_id
+)
+SELECT
+  p.dt_baseline AS snapshot_baseline,
+  p.dt_latest AS snapshot_latest,
+  COUNT(DISTINCT c.account_id) AS n_accounts_swap_from_agentforce,
+  SUM(c.pov_swapped_off_af_lines) AS sum_pov_swapped_off_af_lines,
+  SUM(c.shelfware_on_af_from_lines_baseline) AS sum_shelfware_baseline_af_from_lines,
+  COUNT_IF(c.af_pov_exit_type = 'Full_exit') AS n_accounts_full_af_exit,
+  COUNT_IF(c.af_pov_exit_type = 'Partial_exit') AS n_accounts_partial_af_exit,
+  COUNT_IF(c.af_pov_exit_type = 'No_reduction_or_increase') AS n_accounts_no_af_reduction,
+  COUNT_IF(c.af_pov_exit_type = 'No_jan_af_pov') AS n_accounts_no_jan_af_pov
+FROM acct_classified c
+CROSS JOIN params p
+;
+
+/*------------------------------------------------------------------------------
+  3) ONE ROW PER "SWAPPED TO" LINE — same rules as (1); with default params,
+      only Mar_only (grain absent on baseline) + new POV on latest.
+------------------------------------------------------------------------------*/
+WITH params AS (
+  SELECT
+    DATE '2026-01-01' AS dt_baseline,
+    DATE '2026-03-01' AS dt_latest,
+    TRUE AS require_dest_absent_in_baseline
+),
+target_accounts AS (
+  SELECT DISTINCT tl.account_id AS account_id
+  FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+  WHERE tl.account_id IS NOT NULL
+),
+trending AS (
+  SELECT
+    t.account_id,
+    t.sub_category,
+    t.sub_capability,
+    t.custom_l1,
+    t.snapshot_dt::DATE AS snapshot_dt,
+    t.shelfware,
+    t.pov,
+    t.pov_at_risk
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+  INNER JOIN target_accounts ta ON t.account_id = ta.account_id
+  CROSS JOIN params p
+  WHERE t.snapshot_dt::DATE IN (p.dt_baseline, p.dt_latest)
+),
+baseline AS (
+  SELECT t.*
+  FROM trending t
+  CROSS JOIN params p
+  WHERE t.snapshot_dt = p.dt_baseline
+),
+latest AS (
+  SELECT t.*
+  FROM trending t
+  CROSS JOIN params p
+  WHERE t.snapshot_dt = p.dt_latest
+),
+detail AS (
+  SELECT
+    COALESCE(b.account_id, l.account_id) AS account_id,
+    COALESCE(b.sub_category, l.sub_category) AS sub_category,
+    COALESCE(b.sub_capability, l.sub_capability) AS sub_capability,
+    COALESCE(b.custom_l1, l.custom_l1) AS custom_l1,
+    b.shelfware AS shelfware_baseline,
+    l.shelfware AS shelfware_latest,
+    b.pov AS pov_baseline,
+    l.pov AS pov_latest,
+    b.pov_at_risk AS pov_at_risk_baseline,
+    l.pov_at_risk AS pov_at_risk_latest,
+    CASE
+      WHEN b.account_id IS NULL THEN 'Mar_only'
+      WHEN l.account_id IS NULL THEN 'Jan_only'
+      ELSE 'Both_months'
+    END AS period_coverage
+  FROM baseline b
+  FULL OUTER JOIN latest l
+    ON b.account_id = l.account_id
+   AND EQUAL_NULL(b.sub_category, l.sub_category)
+   AND EQUAL_NULL(b.sub_capability, l.sub_capability)
+   AND EQUAL_NULL(b.custom_l1, l.custom_l1)
+),
+from_line AS (
+  SELECT *
+  FROM detail
+  WHERE period_coverage = 'Both_months'
+    AND ZEROIFNULL(pov_baseline) > 0
+    AND ZEROIFNULL(pov_latest) = 0
+),
+to_line AS (
+  SELECT *
+  FROM detail
+  WHERE (period_coverage = 'Both_months'
+         AND ZEROIFNULL(pov_baseline) = 0
+         AND ZEROIFNULL(pov_latest) > 0)
+     OR (period_coverage = 'Mar_only'
+         AND ZEROIFNULL(pov_latest) > 0)
+),
+to_line_for_swap AS (
+  SELECT t.*
+  FROM to_line t
+  CROSS JOIN params p
+  WHERE NOT p.require_dest_absent_in_baseline
+     OR t.period_coverage = 'Mar_only'
+),
+swap_accounts AS (
+  SELECT DISTINCT f.account_id
+  FROM from_line f
+  WHERE EXISTS (SELECT 1 FROM to_line_for_swap t WHERE t.account_id = f.account_id)
+),
+from_af AS (
+  SELECT f.*
+  FROM from_line f
+  INNER JOIN swap_accounts s ON s.account_id = f.account_id
+  WHERE f.sub_category = 'Agentforce'
+),
+to_destination AS (
+  SELECT
+    t.account_id,
+    t.sub_category AS swapped_to_sub_category,
+    t.sub_capability AS swapped_to_sub_capability,
+    t.custom_l1 AS swapped_to_custom_l1,
+    MAX(ZEROIFNULL(t.pov_latest)) AS new_pov,
+    MAX(ZEROIFNULL(t.shelfware_latest)) AS new_shelfware,
+    MAX(t.period_coverage) AS to_line_period_coverage
+  FROM to_line_for_swap t
+  INNER JOIN (SELECT DISTINCT account_id FROM from_af) x ON x.account_id = t.account_id
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM from_af ff
+    WHERE ff.account_id = t.account_id
+      AND EQUAL_NULL(ff.sub_category, t.sub_category)
+      AND EQUAL_NULL(ff.sub_capability, t.sub_capability)
+      AND EQUAL_NULL(ff.custom_l1, t.custom_l1)
+  )
+  GROUP BY 1, 2, 3, 4
+)
+SELECT
+  p.dt_baseline AS snapshot_baseline,
+  p.dt_latest AS snapshot_latest,
+  d.account_id,
+  d.swapped_to_sub_category,
+  d.swapped_to_sub_capability,
+  d.swapped_to_custom_l1,
+  d.new_shelfware,
+  d.to_line_period_coverage,
+  IFF(d.to_line_period_coverage = 'Mar_only', TRUE, FALSE) AS absent_on_baseline_snapshot,
+  '$' || TO_VARCHAR(ROUND(d.new_pov, 2)) AS new_pov_usd
+FROM to_destination d
+CROSS JOIN params p
+ORDER BY d.account_id, d.swapped_to_sub_category, d.swapped_to_sub_capability, d.swapped_to_custom_l1
+;
+
+/*------------------------------------------------------------------------------
+  4) ALL-PRODUCT SWAP DASHBOARD — one row per account (optional from-subcategory)
+      - Swap = same as (1): from_line (POV>0->0) + to_line_for_swap on account.
+      - from_subcategory_filter NULL = all "from" products; set to e.g. 'Agentforce' to subset accounts.
+      - Beginning / current: LISTAGG on from lines + to_destination; account POV@risk + shelfware %
+        (shelfware % = 100 * SUM(shelfware)/NULLIF(SUM(pov),0) at account level — confirm vs Jim's official def.)
+------------------------------------------------------------------------------*/
+WITH params AS (
+  SELECT
+    DATE '2026-01-01' AS dt_baseline,
+    DATE '2026-03-01' AS dt_latest,
+    TRUE AS require_dest_absent_in_baseline,
+    CAST(NULL AS VARCHAR(256)) AS from_subcategory_filter /* NULL = all products */
+),
+
+target_accounts AS (
+  SELECT DISTINCT tl.account_id AS account_id
+  FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+  WHERE tl.account_id IS NOT NULL
+),
+
+trending AS (
+  SELECT
+    t.account_id,
+    t.sub_category,
+    t.sub_capability,
+    t.custom_l1,
+    t.snapshot_dt::DATE AS snapshot_dt,
+    t.shelfware,
+    t.pov,
+    t.pov_at_risk
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+  INNER JOIN target_accounts ta ON t.account_id = ta.account_id
+  CROSS JOIN params p
+  WHERE t.snapshot_dt::DATE IN (p.dt_baseline, p.dt_latest)
+),
+
+baseline AS (
+  SELECT t.*
+  FROM trending t
+  CROSS JOIN params p
+  WHERE t.snapshot_dt = p.dt_baseline
+),
+
+latest AS (
+  SELECT t.*
+  FROM trending t
+  CROSS JOIN params p
+  WHERE t.snapshot_dt = p.dt_latest
+),
+
+detail AS (
+  SELECT
+    COALESCE(b.account_id, l.account_id) AS account_id,
+    COALESCE(b.sub_category, l.sub_category) AS sub_category,
+    COALESCE(b.sub_capability, l.sub_capability) AS sub_capability,
+    COALESCE(b.custom_l1, l.custom_l1) AS custom_l1,
+    b.shelfware AS shelfware_baseline,
+    l.shelfware AS shelfware_latest,
+    b.pov AS pov_baseline,
+    l.pov AS pov_latest,
+    b.pov_at_risk AS pov_at_risk_baseline,
+    l.pov_at_risk AS pov_at_risk_latest,
+    CASE
+      WHEN b.account_id IS NULL THEN 'Mar_only'
+      WHEN l.account_id IS NULL THEN 'Jan_only'
+      ELSE 'Both_months'
+    END AS period_coverage
+  FROM baseline b
+  FULL OUTER JOIN latest l
+    ON b.account_id = l.account_id
+   AND EQUAL_NULL(b.sub_category, l.sub_category)
+   AND EQUAL_NULL(b.sub_capability, l.sub_capability)
+   AND EQUAL_NULL(b.custom_l1, l.custom_l1)
+),
+
+from_line AS (
+  SELECT *
+  FROM detail
+  WHERE period_coverage = 'Both_months'
+    AND ZEROIFNULL(pov_baseline) > 0
+    AND ZEROIFNULL(pov_latest) = 0
+),
+
+to_line AS (
+  SELECT *
+  FROM detail
+  WHERE (period_coverage = 'Both_months'
+         AND ZEROIFNULL(pov_baseline) = 0
+         AND ZEROIFNULL(pov_latest) > 0)
+     OR (period_coverage = 'Mar_only'
+         AND ZEROIFNULL(pov_latest) > 0)
+),
+
+to_line_for_swap AS (
+  SELECT t.*
+  FROM to_line t
+  CROSS JOIN params p
+  WHERE NOT p.require_dest_absent_in_baseline
+     OR t.period_coverage = 'Mar_only'
+),
+
+swap_accounts AS (
+  SELECT DISTINCT f.account_id
+  FROM from_line f
+  WHERE EXISTS (SELECT 1 FROM to_line_for_swap t WHERE t.account_id = f.account_id)
+),
+
+swap_accounts_filtered AS (
+  SELECT s.account_id
+  FROM swap_accounts s
+  CROSS JOIN params p
+  WHERE p.from_subcategory_filter IS NULL
+     OR EXISTS (
+       SELECT 1
+       FROM from_line fl
+       WHERE fl.account_id = s.account_id
+         AND fl.sub_category = p.from_subcategory_filter
+     )
+),
+
+from_products_agg AS (
+  SELECT
+    f.account_id,
+    LISTAGG(
+      f.sub_category || ' / ' || COALESCE(f.sub_capability, '') || ' / ' || COALESCE(f.custom_l1, ''),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY f.sub_category, f.sub_capability, f.custom_l1
+    ) AS swapped_from_products,
+    LISTAGG(
+      '$' || TO_VARCHAR(ROUND(ZEROIFNULL(f.pov_baseline), 2)),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY f.sub_category, f.sub_capability, f.custom_l1
+    ) AS swapped_from_pov_usd,
+    LISTAGG(
+      '$' || TO_VARCHAR(ROUND(ZEROIFNULL(f.pov_at_risk_baseline), 2)),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY f.sub_category, f.sub_capability, f.custom_l1
+    ) AS swapped_from_pov_at_risk_usd,
+    LISTAGG(
+      '$' || TO_VARCHAR(ROUND(ZEROIFNULL(f.shelfware_baseline), 2)),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY f.sub_category, f.sub_capability, f.custom_l1
+    ) AS swapped_from_shelfware_usd,
+    SUM(ZEROIFNULL(f.pov_baseline)) AS sum_pov_removed_from_lines,
+    COUNT(*) AS n_from_lines
+  FROM from_line f
+  INNER JOIN swap_accounts_filtered sf ON sf.account_id = f.account_id
+  CROSS JOIN params p
+  WHERE p.from_subcategory_filter IS NULL
+     OR f.sub_category = p.from_subcategory_filter
+  GROUP BY 1
+),
+
+to_destination AS (
+  SELECT
+    t.account_id,
+    t.sub_category,
+    t.sub_capability,
+    t.custom_l1,
+    MAX(ZEROIFNULL(t.pov_latest)) AS new_pov,
+    MAX(ZEROIFNULL(t.pov_at_risk_latest)) AS new_pov_at_risk,
+    MAX(ZEROIFNULL(t.shelfware_latest)) AS new_shelfware,
+    MAX(t.period_coverage) AS to_line_period_coverage
+  FROM to_line_for_swap t
+  INNER JOIN swap_accounts_filtered sf ON sf.account_id = t.account_id
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM from_line fl
+    WHERE fl.account_id = t.account_id
+      AND EQUAL_NULL(fl.sub_category, t.sub_category)
+      AND EQUAL_NULL(fl.sub_capability, t.sub_capability)
+      AND EQUAL_NULL(fl.custom_l1, t.custom_l1)
+  )
+  GROUP BY 1, 2, 3, 4
+),
+
+to_products_agg AS (
+  SELECT
+    account_id,
+    LISTAGG(
+      sub_category || ' / ' || COALESCE(sub_capability, '') || ' / ' || COALESCE(custom_l1, ''),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY sub_category, sub_capability, custom_l1
+    ) AS swapped_to_products,
+    LISTAGG(
+      '$' || TO_VARCHAR(ROUND(new_pov, 2)),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY sub_category, sub_capability, custom_l1
+    ) AS swapped_to_new_pov_usd,
+    LISTAGG(
+      '$' || TO_VARCHAR(ROUND(ZEROIFNULL(new_pov_at_risk), 2)),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY sub_category, sub_capability, custom_l1
+    ) AS swapped_to_pov_at_risk_usd,
+    LISTAGG(
+      '$' || TO_VARCHAR(ROUND(ZEROIFNULL(new_shelfware), 2)),
+      ' || '
+    ) WITHIN GROUP (
+      ORDER BY sub_category, sub_capability, custom_l1
+    ) AS swapped_to_shelfware_usd,
+    SUM(ZEROIFNULL(new_pov)) AS sum_new_pov_to_lines,
+    COUNT(*) AS n_to_lines
+  FROM to_destination
+  GROUP BY 1
+),
+
+acct_rollups AS (
+  SELECT
+    d.account_id,
+    SUM(IFF(d.period_coverage IN ('Both_months', 'Jan_only'), ZEROIFNULL(d.pov_at_risk_baseline), 0)) AS pov_at_risk_beginning,
+    SUM(IFF(d.period_coverage IN ('Both_months', 'Mar_only'), ZEROIFNULL(d.pov_at_risk_latest), 0)) AS pov_at_risk_current,
+    SUM(IFF(d.period_coverage IN ('Both_months', 'Jan_only'), ZEROIFNULL(d.shelfware_baseline), 0)) AS shelfware_sum_beginning,
+    SUM(IFF(d.period_coverage IN ('Both_months', 'Jan_only'), ZEROIFNULL(d.pov_baseline), 0)) AS pov_sum_beginning,
+    SUM(IFF(d.period_coverage IN ('Both_months', 'Mar_only'), ZEROIFNULL(d.shelfware_latest), 0)) AS shelfware_sum_current,
+    SUM(IFF(d.period_coverage IN ('Both_months', 'Mar_only'), ZEROIFNULL(d.pov_latest), 0)) AS pov_sum_current
+  FROM detail d
+  INNER JOIN swap_accounts_filtered sf ON sf.account_id = d.account_id
+  GROUP BY 1
+),
+
+acct_rollups_pct AS (
+  SELECT
+    account_id,
+    pov_at_risk_beginning,
+    pov_at_risk_current,
+    shelfware_sum_beginning,
+    pov_sum_beginning,
+    shelfware_sum_current,
+    pov_sum_current,
+    100 * shelfware_sum_beginning / NULLIF(pov_sum_beginning, 0) AS shelfware_pct_beginning,
+    100 * shelfware_sum_current / NULLIF(pov_sum_current, 0) AS shelfware_pct_current
+  FROM acct_rollups
+)
+
+SELECT
+  p.dt_baseline AS snapshot_baseline,
+  p.dt_latest AS snapshot_latest,
+  p.from_subcategory_filter AS from_subcategory_filter_applied,
+  p.require_dest_absent_in_baseline AS require_dest_absent_in_baseline,
+  sf.account_id,
+  fp.swapped_from_products,
+  fp.swapped_from_pov_usd,
+  fp.swapped_from_pov_at_risk_usd,
+  fp.swapped_from_shelfware_usd,
+  fp.sum_pov_removed_from_lines,
+  fp.n_from_lines,
+  tp.swapped_to_products,
+  tp.swapped_to_new_pov_usd,
+  tp.swapped_to_pov_at_risk_usd,
+  tp.swapped_to_shelfware_usd,
+  tp.sum_new_pov_to_lines,
+  tp.n_to_lines,
+  ar.pov_at_risk_beginning,
+  ar.pov_at_risk_current,
+  ar.shelfware_pct_beginning,
+  ar.shelfware_pct_current,
+  ar.shelfware_sum_beginning,
+  ar.pov_sum_beginning,
+  ar.shelfware_sum_current,
+  ar.pov_sum_current
+FROM swap_accounts_filtered sf
+CROSS JOIN params p
+LEFT JOIN from_products_agg fp ON fp.account_id = sf.account_id
+LEFT JOIN to_products_agg tp ON tp.account_id = sf.account_id
+LEFT JOIN acct_rollups_pct ar ON ar.account_id = sf.account_id
+ORDER BY fp.sum_pov_removed_from_lines DESC NULLS LAST;
