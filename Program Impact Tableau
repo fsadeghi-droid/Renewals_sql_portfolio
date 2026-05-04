@@ -1,0 +1,228 @@
+WITH
+/* ============================================================================
+   0) TARGET LIST (DRIVING TABLE)
+   Replace <<TARGET_LIST_TABLE>> with your uploaded target-list table.
+   Required columns in that table:
+     - account_id
+     - opportunity_id
+     - rd_program   (optional but recommended)
+   ============================================================================ */
+target_list AS (
+    SELECT
+        t.account_id                                 AS target_account_id,
+        t.opportunity_id                             AS target_opportunity_id,
+        t.rd_program                                 AS target_program_name,
+        TRIM(t.opportunity_id::VARCHAR)              AS opp_id_raw,
+        LEFT(TRIM(t.opportunity_id::VARCHAR), 15)    AS opp_id_15
+    FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.TABLEAU_ALL_PROGRAM_FY27 t
+    WHERE t.opportunity_id IS NOT NULL
+),
+
+/* 1) FX */
+exchange_rate AS (
+    SELECT fm_crncy_cd, conv_rt
+    FROM EDW_HERITAGE_PRD.DM.DIM_EXCHANGE_RATE_MO_VW_VW
+    WHERE to_crncy_cd = 'USD'
+      AND conv_typ    = 'Outlook'
+      AND conv_prd_nm = TO_CHAR(CURRENT_DATE, 'Mon-YY')
+),
+
+/* 2) Program lookup (fallback if target table has null program) */
+program_scope AS (
+    SELECT
+        LEFT(OPPORTUNITY_ID, 15) AS opp_id_15,
+        LISTAGG(DISTINCT RD_PROGRAM, ', ') WITHIN GROUP (ORDER BY RD_PROGRAM) AS program_name
+    FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.TABLEAU_ALL_PROGRAM_FY27
+    WHERE OPPORTUNITY_ID IS NOT NULL
+    GROUP BY 1
+),
+
+/* 3) Filtered opportunity scope (metrics source only; does not drive row count) */
+opty_scope AS (
+    SELECT DISTINCT
+        LEFT(opt.opty_id, 15) AS opp_id_15,
+        opt.acct_id,
+        opt.CLSD_DT
+    FROM EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+    LEFT JOIN SSE_DM_CSG_RPT_PRD.CIDM.CI_DIM_ACCOUNT_VW acct
+        ON opt.ACCT_ID = acct.account_id
+    WHERE opt.curr_rec_flg  = 'Y'
+      AND opt.del_flg        = 'N'
+      AND opt.forcst_cat_cd  <> 'Omitted'
+      AND (opt.opty_typ IN ('Renewal','Contract') OR opt.opty_typ LIKE 'Off-Cycle%' OR opt.opty_typ LIKE '%ISV%')
+      AND opt.opty_rec_typ_ky    IN ('1506','1507')
+      AND opt.targeted_clouds    <> 'Slack Unmigrated'
+      AND opt.forcst_attrtn_amt  <= 0
+      AND acct.account_nm        NOT LIKE 'Renewals Off Cycle Forecasting%'
+      AND (
+            (opt.X30_DY_EXT_TXT NOT IN ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE')
+             AND opt.OPTY_STG_NM IN ('05 Closed','Dead Attrition'))
+            OR opt.OPTY_STG_NM NOT IN ('05 Closed','Dead Attrition')
+            OR opt.X30_DY_EXT_TXT IS NULL
+          )
+),
+
+/* 4) Beginning attrition as of 2026-02-01 */
+beginning AS (
+    SELECT
+        LEFT(opt.opty_id, 15) AS opp_id_15,
+        ROUND(IFNULL(opt.FORCST_ATTRTN_AMT, 0) * IFNULL(crncy.conv_rt, 1), 2) AS beginning_attrition,
+        ROW_NUMBER() OVER (
+            PARTITION BY LEFT(opt.opty_id, 15)
+            ORDER BY opt.REC_STRT_DT DESC, opt.dim_opty_ky DESC
+        ) AS rn
+    FROM EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+    LEFT JOIN exchange_rate crncy
+        ON opt.crncy_cd = crncy.fm_crncy_cd
+    WHERE opt.REC_STRT_DT <= '2026-02-01'
+      AND opt.del_flg = 'N'
+      AND LEFT(opt.opty_id, 15) IN (SELECT DISTINCT opp_id_15 FROM target_list)
+),
+
+/* 5) Current attrition */
+current_rec AS (
+    SELECT
+        LEFT(opt.opty_id, 15) AS opp_id_15,
+        opt.CLSD_DT,
+        opt.OPTY_STG_NM,
+        ROUND(IFNULL(opt.FORCST_ATTRTN_AMT, 0) * IFNULL(crncy.conv_rt, 1), 2) AS current_attrition,
+        ROW_NUMBER() OVER (
+            PARTITION BY LEFT(opt.opty_id, 15)
+            ORDER BY opt.REC_STRT_DT DESC, opt.dim_opty_ky DESC
+        ) AS rn
+    FROM EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+    LEFT JOIN exchange_rate crncy
+        ON opt.crncy_cd = crncy.fm_crncy_cd
+    WHERE opt.curr_rec_flg = 'Y'
+      AND opt.del_flg      = 'N'
+      AND LEFT(opt.opty_id, 15) IN (SELECT DISTINCT opp_id_15 FROM target_list)
+),
+
+/* 6) Renewal fiscal info */
+renewal_info AS (
+    SELECT
+        LEFT(r.RENEWAL_OPTY_ID, 15) AS opp_id_15,
+        r.RENEWAL_FISCAL_QTR,
+        r.RENEWAL_FISCAL_YEAR,
+        ROW_NUMBER() OVER (
+            PARTITION BY LEFT(r.RENEWAL_OPTY_ID, 15)
+            ORDER BY r.RENEWAL_FISCAL_YEAR DESC, r.RENEWAL_FISCAL_QTR DESC
+        ) AS rn
+    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW r
+),
+
+/* 7) Renewal detail latest snapshot */
+renewal_detail AS (
+    SELECT
+        LEFT(r.RENEWAL_OPTY_ID, 15)                         AS opp_id_15,
+        r.RENEWAL_OPTY_NM,
+        r.ACCOUNT_NM,
+        r.RENEWAL_OPTY_TYPE,
+        r.AE_ROLE_NM,
+        r.CSG_TERRITORY,
+        r.CSG_AREA,
+        r.CSG_GEO,
+        r.CSG_PORTFOLIO,
+        r.TEAM_TERRITORY,
+        r.ACCOUNT_LVL_2_USR_NM,
+        r.ACCOUNT_LVL_3_USR_NM,
+        r.ACCOUNT_LVL_4_USR_NM,
+        r.ACCOUNT_LVL_2_USR_ROLE,
+        r.ACCOUNT_LVL_3_USR_ROLE,
+        r.ACCOUNT_LVL_4_USR_ROLE,
+        r.RENEWAL_AMT_CONV,
+        r.RENEWAL_ATR_CONV,
+        r.RENEWAL_FCAST_ATTRITION_CONV,
+        r.CONV_SWING_AMT,
+        r.ROR_APPROVED_AMT,
+        r.RENEWAL_CLOSE_MONTH,
+        r.RENEWAL_CLSD_DT,
+        r.RENEWAL_CONTRACT_END_DATE,
+        r.RENEWAL_KEY_RISK_CAT,
+        r.geo,
+        r.SNAP_DATE AS current_dt,
+        r.src_crte_dt AS create_dt,
+        r.OPPTY_USR_ID,
+        r.RENEWAL_OPTY_OWNR_NM AS renewal_manager,
+        CASE WHEN DAYOFWEEK(r.SNAP_DATE) = 1 THEN 1 ELSE 0 END AS is_monday,
+        CASE
+            WHEN r.RENEWAL_OPTY_TYPE IN ('Contract','Renewal') THEN 'Oncycle'
+            WHEN r.RENEWAL_OPTY_TYPE LIKE 'Off-Cycle%'         THEN 'Offcycle'
+            WHEN r.RENEWAL_OPTY_TYPE = 'ISV'                   THEN 'ISV'
+            ELSE 'Oncycle'
+        END AS opportunity_type,
+        u.MGR_FRST_NM AS rmm_first_name,
+        u.MGR_LST_NM  AS rmm_last_name,
+        CONCAT(u.MGR_FRST_NM, ' ', u.MGR_LST_NM) AS rmm_full_name
+    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.CI_RENEWAL_OPTY_DAILY_SNAP_VW r
+    LEFT JOIN EDW_PRD.DM.DIM_USER_ORG62_SV u
+        ON r.OPPTY_USR_ID = u.USR_ID_15
+       AND u.CURR_REC_FLG = 'Y'
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY LEFT(r.RENEWAL_OPTY_ID, 15)
+        ORDER BY r.SNAP_DATE DESC
+    ) = 1
+)
+
+SELECT
+    /* Required target-list columns */
+    t.target_account_id                               AS account_id,
+    t.target_opportunity_id                           AS opportunity_id,
+    COALESCE(t.target_program_name, ps.program_name) AS "Program_Name",
+
+    /* Other metrics */
+    s.acct_id                                         AS acct_id_from_opty_scope,
+    rd.RENEWAL_OPTY_NM                                AS opportunity_name,
+    rd.ACCOUNT_NM                                     AS account_name,
+
+    rd.CSG_TERRITORY,
+    rd.CSG_AREA,
+    rd.CSG_GEO,
+    rd.CSG_PORTFOLIO,
+    rd.TEAM_TERRITORY,
+    rd.geo,
+    rd.AE_ROLE_NM,
+    rd.ACCOUNT_LVL_2_USR_NM,
+    rd.ACCOUNT_LVL_3_USR_NM,
+    rd.ACCOUNT_LVL_4_USR_NM,
+    rd.ACCOUNT_LVL_2_USR_ROLE,
+    rd.ACCOUNT_LVL_3_USR_ROLE,
+    rd.ACCOUNT_LVL_4_USR_ROLE,
+    rd.renewal_manager,
+    rd.rmm_first_name,
+    rd.rmm_last_name,
+    rd.rmm_full_name,
+
+    rd.opportunity_type,
+    cur.OPTY_STG_NM                                   AS stage,
+    rd.RENEWAL_KEY_RISK_CAT,
+    rd.is_monday,
+
+    ren.RENEWAL_FISCAL_YEAR,
+    ren.RENEWAL_FISCAL_QTR,
+    rd.RENEWAL_CLOSE_MONTH,
+    rd.RENEWAL_CLSD_DT,
+    rd.RENEWAL_CONTRACT_END_DATE,
+
+    IFNULL(b.beginning_attrition, 0)                 AS beginning_attrition,
+    IFNULL(cur.current_attrition, 0)                 AS current_attrition,
+    ROUND(IFNULL(cur.current_attrition, 0) - IFNULL(b.beginning_attrition, 0), 2) AS attrition_change,
+
+    rd.RENEWAL_AMT_CONV,
+    rd.RENEWAL_ATR_CONV,
+    rd.RENEWAL_FCAST_ATTRITION_CONV,
+    rd.CONV_SWING_AMT,
+    rd.ROR_APPROVED_AMT,
+
+    rd.current_dt,
+    rd.create_dt
+
+FROM target_list t
+LEFT JOIN program_scope   ps  ON t.opp_id_15 = ps.opp_id_15
+LEFT JOIN opty_scope      s   ON t.opp_id_15 = s.opp_id_15
+LEFT JOIN beginning       b   ON t.opp_id_15 = b.opp_id_15  AND b.rn = 1
+LEFT JOIN current_rec     cur ON t.opp_id_15 = cur.opp_id_15 AND cur.rn = 1
+LEFT JOIN renewal_info    ren ON t.opp_id_15 = ren.opp_id_15 AND ren.rn = 1
+LEFT JOIN renewal_detail  rd  ON t.opp_id_15 = rd.opp_id_15
+
+ORDER BY t.target_account_id, t.target_opportunity_id;
