@@ -1,0 +1,774 @@
+/* =============================================================================
+   Shelfware + FY27 target list + council — Tableau-oriented extracts
+
+   Based on the same trending join / baseline-latest FULL OUTER pattern as
+   agentforce_swaps_snowflake.sql (queries 4–5), extended to:
+   - All products (no Agentforce-only restriction unless you add a filter).
+   - Target list at opportunity grain; shelfware trending at account × product.
+   - Optional join to OFFERS_DE.ATTRITION_COUNCIL_DATASET_VW. Council columns
+     match the Shelfware council extract (e.g. FY27 Excel): ACCT_ID, RENEWAL_OPTY_ID,
+     RENEWAL_OPTY_ID_18, RENEWAL_DT (as RENEWAL_CLOSE_DT on bridge output),
+     MARKET_SEGMENT, GLB_CO_NM, GLOBAL_CO_COMBO_ID,
+     ASSIGNED_ACCOUNT_AOV_BAND, SUCCESS_PLAN, ACCT_NM, CSG_AREA, CSG_TERRITORY,
+     CSG_PORTFOLIO, ACCT_AOV_BAND, AE_FULL_NM, OPTY_NM, FISCAL_YR, FISCAL_QTR.
+     Run DESC VIEW if the view differs.
+
+   Tableau setup (recommended):
+   1) Extract A — "Opportunity bridge": query OPPORTUNITY_BRIDGE (one row per
+      target-list opportunity + council attributes). Use for filters
+      (segment, CSG, opty name, renewal id, fiscal period, etc.).
+   2) Extract B — "Trending long": query TRENDING_LONG. Use for trend lines /
+      snapshot picker lists (snapshot_dt > 2025-01-01). IS_SELA lives here only
+      (use as a Tableau filter; not repeated on compare extracts).
+   3) Extract C — "Account compare": query ACCOUNT_COMPARE_OPTY_GRAIN. Edit
+      params CTE dates (or duplicate the SQL per workbook with different dates).
+      Join or relate to A on account_id (and opportunity_id for opty grain).
+      Filter quarterly impact using RENEWAL_CLOSE_DT / FISCAL_* from A or from C;
+      use snapshot_baseline_dt / snapshot_compare_dt only for shelfware movement.
+      aggregate measures with SUM/AVG at account level, or use FIXED LOD:
+        { FIXED [account_id] : SUM([pov_sum_baseline]) }
+      when you need account totals while filtering oppty (Tableau will duplicate
+      account metrics per oppty row — use MIN/MAX/FIXED for account KPIs).
+   4) Extract D — "Product line compare": query PRODUCT_LINE_COMPARE_GRAIN for
+      line-level movement; swap flags use sub_category rollups only.
+   5) Extract E — "Trending two snapshots (all columns)": file
+      shelfware_tableau_trending_compare_full_columns_long.sql — baseline vs
+      compare rows stacked with compare_role; full POV_WEIGHTED_SHELFWARE_TRENDING_VW
+      projection for movement / POV analysis in Tableau.
+
+   Trending CTEs in C and D remain a focused column list; full view width is
+   exposed to Tableau only in TRENDING_LONG (B) and in
+   shelfware_tableau_trending_compare_full_columns_long.sql (E).
+
+   Date parameters in Tableau: Snowflake Custom SQL does not always bind
+   Tableau parameters cleanly. Practical options:
+   - Edit the params CTE before each refresh; or
+   - Publish multiple data sources (one pair of dates each); or
+   - Use Tableau Prep to pass dates into a flow; or
+   - Use a two-row "parameter table" in Snowflake and join (ask analytics eng).
+
+   Trending view: SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW
+   If IS_SELA / column names differ, DESC VIEW and adjust.
+
+   Swap detection (ACCOUNT_COMPARE + swap flags on PRODUCT_LINE): POV is rolled
+   up to account × sub_category before from/to lines (sub_category swap only).
+   All opportunity rows come from SHELFWARE_TARGET_LIST_FY27 only.
+
+   Shelfware impact methodology (aligned May 1, 2026):
+   - Scope: full FY target list in SQL (no quarter filter here). Filter which
+     renewals belong in Q1 vs Q2 vs full-year impact in Tableau using council
+     RENEWAL_CLOSE_DT and FISCAL_YR / FISCAL_QTR from OPPORTUNITY_BRIDGE or the
+     same columns on ACCOUNT_COMPARE output — use renewal close date for
+     quarterly impact, not trending snapshot_dt.
+   - Trending params (dt_baseline / dt_compare): shelfware / POV movement between
+     two shelfware snapshots only; they do not define which opportunities sit in
+     which fiscal quarter.
+   - Q2 2026 target list: refresh SHELFWARE_TARGET_LIST_FY27 after the May 10
+     data refresh before pulling Q2 cuts; subcategory POV / POV-at-risk logic
+     and 50% shelfware targeting for Q2 unchanged in SQL (apply >= 50% in
+     Tableau on shelfware_pct_* as needed).
+   ============================================================================= */
+
+
+/*------------------------------------------------------------------------------
+  OPPORTUNITY_BRIDGE — one row per target-list opportunity + council
+
+  Rows are ONLY from SHELFWARE_TARGET_LIST_FY27 (council is LEFT JOIN enrich).
+  Dedupes duplicate target-list rows per (account_id, opportunity_id).
+  RENEWAL_CLOSE_DT = council renewal_dt (close): use in Tableau to bucket
+  opportunities by fiscal quarter for impact reporting; do not use trending
+  snapshot dates for that purpose.
+------------------------------------------------------------------------------*/
+WITH target_list AS (
+  SELECT
+    tl.*,
+    tl.account_id AS bridge_account_id
+  FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+  WHERE tl.account_id IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY tl.account_id, tl.opportunity_id
+      ORDER BY tl.opportunity_id
+    ) = 1
+),
+
+council_dedup AS (
+  SELECT c.*
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.ATTRITION_COUNCIL_DATASET_VW c
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY c.acct_id, COALESCE(c.renewal_opty_id, c.renewal_opty_id_18)
+      ORDER BY c.renewal_dt DESC NULLS LAST
+    ) = 1
+)
+
+SELECT
+  tl.bridge_account_id AS account_id,
+  tl.opportunity_id AS target_list_opportunity_id,
+  /* Account display name: council only (target list has no account name column). */
+  /* Council / Excel (Shelfware Overall FY27 extract) — same logical names as file */
+  c.market_segment AS MARKET_SEGMENT,
+  c.glb_co_nm AS GLB_CO_NM,
+  c.global_co_combo_id AS GLOBAL_CO_COMBO_ID,
+  c.assigned_account_aov_band AS ASSIGNED_ACCOUNT_AOV_BAND,
+  c.success_plan AS SUCCESS_PLAN,
+  c.acct_nm AS ACCT_NM,
+  c.csg_area AS CSG_AREA,
+  c.csg_territory AS CSG_TERRITORY,
+  c.csg_portfolio AS CSG_PORTFOLIO,
+  c.acct_aov_band AS ACCT_AOV_BAND,
+  c.ae_full_nm AS AE_FULL_NM,
+  c.opty_nm AS OPTY_NM,
+  c.renewal_opty_id AS RENEWAL_OPTY_ID,
+  c.renewal_opty_id_18 AS RENEWAL_OPTY_ID_18,
+  c.renewal_dt::DATE AS RENEWAL_CLOSE_DT,
+  c.fiscal_yr AS FISCAL_YR,
+  c.fiscal_qtr AS FISCAL_QTR
+FROM target_list tl
+LEFT JOIN council_dedup c
+  ON tl.bridge_account_id = c.acct_id
+ AND (
+   tl.opportunity_id = c.renewal_opty_id
+   OR tl.opportunity_id = c.renewal_opty_id_18
+   OR TRIM(COALESCE(tl.opportunity_id::VARCHAR, '')) = TRIM(COALESCE(c.renewal_opty_id::VARCHAR, ''))
+   OR TRIM(COALESCE(tl.opportunity_id::VARCHAR, '')) = TRIM(COALESCE(c.renewal_opty_id_18::VARCHAR, ''))
+ )
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY tl.bridge_account_id, tl.opportunity_id
+    ORDER BY c.renewal_dt DESC NULLS LAST
+  ) = 1
+;
+
+
+/*------------------------------------------------------------------------------
+  TRENDING_LONG — account × product × snapshot for all snapshots after 2025-01-01
+
+  All columns from POV_WEIGHTED_SHELFWARE_TRENDING_VW (t.*) plus council ACCT_NM.
+  If compile fails on EXCLUDE(account_name), the view may not expose that column
+  — remove EXCLUDE and accept duplicate name or alias council as COUNCIL_ACCT_NM.
+------------------------------------------------------------------------------*/
+WITH council_acct_nm AS (
+  SELECT
+    c.acct_id AS account_id,
+    MAX(c.acct_nm) AS acct_nm
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.ATTRITION_COUNCIL_DATASET_VW c
+  INNER JOIN (
+    SELECT DISTINCT tl.account_id
+    FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+    WHERE tl.account_id IS NOT NULL
+  ) x ON c.acct_id = x.account_id
+  GROUP BY c.acct_id
+)
+
+SELECT
+  t.* EXCLUDE (account_name),
+  nm.acct_nm AS ACCT_NM
+FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+INNER JOIN (
+  SELECT DISTINCT tl.account_id
+  FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+  WHERE tl.account_id IS NOT NULL
+) x ON t.account_id = x.account_id
+LEFT JOIN council_acct_nm nm ON nm.account_id = t.account_id
+WHERE t.snapshot_dt::DATE > DATE '2025-01-01'
+ORDER BY t.account_id, t.snapshot_dt, t.sub_category, t.sub_capability, t.custom_l1
+;
+
+
+/*------------------------------------------------------------------------------
+  ACCOUNT_COMPARE_OPTY_GRAIN — edit params; one row per target-list opportunity
+
+  Opportunities are only those on SHELFWARE_TARGET_LIST_FY27 (see target_oppty).
+  ACCT_NM / account_name: council acct_nm matched on account_id to trending rows
+  (council_acct_nm.account_id = trending.account_id); target list has no name.
+  RENEWAL_CLOSE_DT / fiscal fields: council renewal close for Tableau quarter
+  filters (impact scope); trending snapshot params are for movement only.
+  Inferred swap flags use sub_category rollups only (not sub_capability/custom_l1).
+  Repeats account-level metrics on every opportunity row; use MIN/MAX/FIXED
+  in Tableau when filtering by opty to avoid double-counting account sums.
+  pov_sum_* and pov_at_risk_sum_* are full-account rollups from trending (not
+  split by opportunity). Full trending view width for Tableau: TRENDING_LONG (B)
+  or shelfware_tableau_trending_compare_full_columns_long.sql (E).
+------------------------------------------------------------------------------*/
+WITH params AS (
+  SELECT
+    DATE '2026-01-01' AS dt_baseline,
+    DATE '2026-03-01' AS dt_compare,
+    TRUE AS require_dest_absent_in_baseline
+),
+
+target_list_acct AS (
+  SELECT DISTINCT tl.account_id
+  FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+  WHERE tl.account_id IS NOT NULL
+),
+
+council_dedup AS (
+  SELECT c.*
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.ATTRITION_COUNCIL_DATASET_VW c
+  INNER JOIN target_list_acct ta ON c.acct_id = ta.account_id
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY c.acct_id, COALESCE(c.renewal_opty_id, c.renewal_opty_id_18)
+      ORDER BY c.renewal_dt DESC NULLS LAST
+    ) = 1
+),
+
+target_oppty AS (
+  SELECT
+    tl.account_id,
+    tl.opportunity_id,
+    MAX(c.acct_nm) AS account_name,
+    MAX(c.renewal_dt)::DATE AS renewal_close_dt,
+    MAX(c.fiscal_yr) AS fiscal_yr,
+    MAX(c.fiscal_qtr) AS fiscal_qtr
+  FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+  LEFT JOIN council_dedup c
+    ON tl.account_id = c.acct_id
+   AND (
+     tl.opportunity_id = c.renewal_opty_id
+     OR tl.opportunity_id = c.renewal_opty_id_18
+     OR TRIM(COALESCE(tl.opportunity_id::VARCHAR, '')) = TRIM(COALESCE(c.renewal_opty_id::VARCHAR, ''))
+     OR TRIM(COALESCE(tl.opportunity_id::VARCHAR, '')) = TRIM(COALESCE(c.renewal_opty_id_18::VARCHAR, ''))
+   )
+  WHERE tl.account_id IS NOT NULL
+  GROUP BY tl.account_id, tl.opportunity_id
+),
+
+target_accounts AS (
+  SELECT DISTINCT account_id FROM target_oppty
+),
+
+/* Council display name per account_id — same join key as POV_WEIGHTED_SHELFWARE_TRENDING_VW.account_id */
+council_acct_nm AS (
+  SELECT
+    c.acct_id AS account_id,
+    MAX(c.acct_nm) AS account_name
+  FROM council_dedup c
+  GROUP BY c.acct_id
+),
+
+trending AS (
+  SELECT
+    t.account_id,
+    nm.account_name, /* acct_nm from council, not from trending view */
+    t.sub_category,
+    t.sub_capability,
+    t.custom_l1,
+    t.sales_ou,
+    t.numerator,
+    t.denominator,
+    t.snapshot_dt::DATE AS snapshot_dt,
+    t.shelfware,
+    t.pov,
+    t.pov_at_risk
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+  INNER JOIN target_accounts ta ON t.account_id = ta.account_id
+  LEFT JOIN council_acct_nm nm ON nm.account_id = t.account_id
+  CROSS JOIN params p
+  WHERE t.snapshot_dt::DATE IN (p.dt_baseline, p.dt_compare)
+),
+
+baseline AS (
+  SELECT t.*
+  FROM trending t
+  CROSS JOIN params p
+  WHERE t.snapshot_dt = p.dt_baseline
+),
+
+latest AS (
+  SELECT t.*
+  FROM trending t
+  CROSS JOIN params p
+  WHERE t.snapshot_dt = p.dt_compare
+),
+
+baseline_subcat AS (
+  SELECT
+    b.account_id,
+    b.sub_category,
+    MAX(b.account_name) AS account_name,
+    SUM(ZEROIFNULL(b.pov)) AS pov_baseline,
+    SUM(ZEROIFNULL(b.pov_at_risk)) AS pov_at_risk_baseline,
+    SUM(ZEROIFNULL(b.shelfware)) AS shelfware_baseline,
+    SUM(ZEROIFNULL(b.numerator)) AS numerator_baseline,
+    SUM(ZEROIFNULL(b.denominator)) AS denominator_baseline
+  FROM baseline b
+  GROUP BY b.account_id, b.sub_category
+),
+
+latest_subcat AS (
+  SELECT
+    l.account_id,
+    l.sub_category,
+    MAX(l.account_name) AS account_name,
+    SUM(ZEROIFNULL(l.pov)) AS pov_latest,
+    SUM(ZEROIFNULL(l.pov_at_risk)) AS pov_at_risk_latest,
+    SUM(ZEROIFNULL(l.shelfware)) AS shelfware_latest,
+    SUM(ZEROIFNULL(l.numerator)) AS numerator_latest,
+    SUM(ZEROIFNULL(l.denominator)) AS denominator_latest
+  FROM latest l
+  GROUP BY l.account_id, l.sub_category
+),
+
+detail_subcat AS (
+  SELECT
+    COALESCE(b.account_id, l.account_id) AS account_id,
+    COALESCE(b.sub_category, l.sub_category) AS sub_category,
+    COALESCE(b.account_name, l.account_name) AS account_name,
+    b.pov_baseline,
+    l.pov_latest,
+    b.pov_at_risk_baseline,
+    l.pov_at_risk_latest,
+    b.shelfware_baseline,
+    l.shelfware_latest,
+    b.numerator_baseline,
+    l.numerator_latest,
+    b.denominator_baseline,
+    l.denominator_latest,
+    CASE
+      WHEN b.account_id IS NULL THEN 'Compare_only'
+      WHEN l.account_id IS NULL THEN 'Baseline_only'
+      ELSE 'Both_dates'
+    END AS period_coverage
+  FROM baseline_subcat b
+  FULL OUTER JOIN latest_subcat l
+    ON b.account_id = l.account_id
+   AND EQUAL_NULL(b.sub_category, l.sub_category)
+),
+
+detail AS (
+  SELECT
+    COALESCE(b.account_id, l.account_id) AS account_id,
+    COALESCE(b.account_name, l.account_name) AS account_name,
+    COALESCE(b.sub_category, l.sub_category) AS sub_category,
+    COALESCE(b.sub_capability, l.sub_capability) AS sub_capability,
+    COALESCE(b.custom_l1, l.custom_l1) AS custom_l1,
+    b.sales_ou AS sales_ou_baseline,
+    l.sales_ou AS sales_ou_latest,
+    b.numerator AS numerator_baseline,
+    l.numerator AS numerator_latest,
+    b.denominator AS denominator_baseline,
+    l.denominator AS denominator_latest,
+    b.shelfware AS shelfware_baseline,
+    l.shelfware AS shelfware_latest,
+    b.pov AS pov_baseline,
+    l.pov AS pov_latest,
+    b.pov_at_risk AS pov_at_risk_baseline,
+    l.pov_at_risk AS pov_at_risk_latest,
+    CASE
+      WHEN b.account_id IS NULL THEN 'Compare_only'
+      WHEN l.account_id IS NULL THEN 'Baseline_only'
+      ELSE 'Both_dates'
+    END AS period_coverage
+  FROM baseline b
+  FULL OUTER JOIN latest l
+    ON b.account_id = l.account_id
+   AND EQUAL_NULL(b.sub_category, l.sub_category)
+   AND EQUAL_NULL(b.sub_capability, l.sub_capability)
+   AND EQUAL_NULL(b.custom_l1, l.custom_l1)
+),
+
+acct_rollups AS (
+  SELECT
+    d.account_id,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Baseline_only'), ZEROIFNULL(d.pov_baseline), 0)) AS pov_sum_baseline,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Compare_only'), ZEROIFNULL(d.pov_latest), 0)) AS pov_sum_compare,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Baseline_only'), ZEROIFNULL(d.pov_at_risk_baseline), 0)) AS pov_at_risk_sum_baseline,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Compare_only'), ZEROIFNULL(d.pov_at_risk_latest), 0)) AS pov_at_risk_sum_compare,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Baseline_only'), ZEROIFNULL(d.shelfware_baseline), 0)) AS shelfware_sum_baseline,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Compare_only'), ZEROIFNULL(d.shelfware_latest), 0)) AS shelfware_sum_compare,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Baseline_only'), ZEROIFNULL(d.numerator_baseline), 0)) AS numerator_sum_baseline,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Compare_only'), ZEROIFNULL(d.numerator_latest), 0)) AS numerator_sum_compare,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Baseline_only'), ZEROIFNULL(d.denominator_baseline), 0)) AS denominator_sum_baseline,
+    SUM(IFF(d.period_coverage IN ('Both_dates', 'Compare_only'), ZEROIFNULL(d.denominator_latest), 0)) AS denominator_sum_compare
+  FROM detail d
+  GROUP BY 1
+),
+
+acct_rollups_pct AS (
+  SELECT
+    account_id,
+    pov_sum_baseline,
+    pov_sum_compare,
+    pov_sum_compare - pov_sum_baseline AS pov_moved_net,
+    pov_at_risk_sum_baseline,
+    pov_at_risk_sum_compare,
+    pov_at_risk_sum_compare - pov_at_risk_sum_baseline AS pov_at_risk_moved_net,
+    shelfware_sum_baseline,
+    shelfware_sum_compare,
+    shelfware_sum_compare - shelfware_sum_baseline AS shelfware_moved_net,
+    100 * shelfware_sum_baseline / NULLIF(pov_sum_baseline, 0) AS shelfware_pct_baseline,
+    100 * shelfware_sum_compare / NULLIF(pov_sum_compare, 0) AS shelfware_pct_compare,
+    100 * numerator_sum_baseline / NULLIF(denominator_sum_baseline, 0) AS shelfware_ratio_num_den_baseline,
+    100 * numerator_sum_compare / NULLIF(denominator_sum_compare, 0) AS shelfware_ratio_num_den_compare,
+    CASE
+      WHEN pov_at_risk_sum_compare < pov_at_risk_sum_baseline THEN 'PAR_improved'
+      WHEN pov_at_risk_sum_compare > pov_at_risk_sum_baseline THEN 'PAR_worsened'
+      ELSE 'PAR_flat'
+    END AS pov_at_risk_direction,
+    CASE
+      WHEN shelfware_sum_compare < shelfware_sum_baseline THEN 'Shelfware_reduced'
+      WHEN shelfware_sum_compare > shelfware_sum_baseline THEN 'Shelfware_increased'
+      ELSE 'Shelfware_flat'
+    END AS shelfware_usd_direction,
+    CASE
+      WHEN ZEROIFNULL(pov_sum_baseline) > 0 AND ZEROIFNULL(pov_sum_compare) = 0 THEN 'Account_full_pov_exit'
+      WHEN ZEROIFNULL(pov_sum_baseline) > 0
+           AND ZEROIFNULL(pov_sum_compare) > 0
+           AND pov_sum_compare < pov_sum_baseline THEN 'Account_partial_pov_exit'
+      WHEN ZEROIFNULL(pov_sum_baseline) = 0 AND ZEROIFNULL(pov_sum_compare) > 0 THEN 'Account_new_pov'
+      WHEN ZEROIFNULL(pov_sum_baseline) > 0 AND pov_sum_compare >= pov_sum_baseline THEN 'Account_pov_same_or_up'
+      ELSE 'Account_other'
+    END AS account_pov_coverage_change
+  FROM acct_rollups
+),
+
+/* Sub_category rollups only (not sub_capability / custom_l1), all products */
+from_line_subcat AS (
+  SELECT *
+  FROM detail_subcat
+  WHERE ZEROIFNULL(pov_baseline) > 0
+    AND ZEROIFNULL(pov_latest) = 0
+    AND period_coverage IN ('Both_dates', 'Baseline_only')
+),
+
+to_line_subcat AS (
+  SELECT *
+  FROM detail_subcat
+  WHERE (period_coverage = 'Both_dates'
+         AND ZEROIFNULL(pov_baseline) = 0
+         AND ZEROIFNULL(pov_latest) > 0)
+     OR (period_coverage = 'Compare_only'
+         AND ZEROIFNULL(pov_latest) > 0)
+),
+
+to_line_for_swap_subcat AS (
+  SELECT t.*
+  FROM to_line_subcat t
+  CROSS JOIN params p
+  WHERE NOT p.require_dest_absent_in_baseline
+     OR t.period_coverage = 'Compare_only'
+),
+
+swap_accounts AS (
+  SELECT DISTINCT f.account_id
+  FROM from_line_subcat f
+  WHERE EXISTS (
+    SELECT 1
+    FROM to_line_for_swap_subcat x
+    WHERE x.account_id = f.account_id
+  )
+)
+
+SELECT
+  p.dt_baseline AS snapshot_baseline_dt,
+  p.dt_compare AS snapshot_compare_dt,
+  o.opportunity_id AS target_list_opportunity_id,
+  o.account_id,
+  COALESCE(acct_nm_by_id.account_name, o.account_name) AS ACCT_NM,
+  o.renewal_close_dt AS RENEWAL_CLOSE_DT,
+  o.fiscal_yr AS FISCAL_YR,
+  o.fiscal_qtr AS FISCAL_QTR,
+  ar.pov_sum_baseline,
+  ar.pov_sum_compare,
+  ar.pov_moved_net,
+  ar.pov_at_risk_sum_baseline,
+  ar.pov_at_risk_sum_compare,
+  ar.pov_at_risk_moved_net,
+  ar.shelfware_sum_baseline,
+  ar.shelfware_sum_compare,
+  ar.shelfware_moved_net,
+  ar.shelfware_pct_baseline,
+  ar.shelfware_pct_compare,
+  ar.shelfware_pct_compare - ar.shelfware_pct_baseline AS shelfware_pct_point_change,
+  ar.shelfware_ratio_num_den_baseline,
+  ar.shelfware_ratio_num_den_compare,
+  ar.pov_at_risk_direction,
+  ar.shelfware_usd_direction,
+  ar.account_pov_coverage_change,
+  IFF(s.account_id IS NOT NULL, TRUE, FALSE) AS account_has_subcategory_swap,
+  IFF(ZEROIFNULL(ar.shelfware_pct_compare) >= 50, TRUE, FALSE) AS shelfware_pct_ge_50_at_compare_dt
+FROM target_oppty o
+CROSS JOIN params p
+INNER JOIN acct_rollups_pct ar ON ar.account_id = o.account_id
+LEFT JOIN council_acct_nm acct_nm_by_id ON acct_nm_by_id.account_id = o.account_id
+LEFT JOIN swap_accounts s ON s.account_id = o.account_id
+ORDER BY o.account_id, o.opportunity_id
+;
+
+
+/*------------------------------------------------------------------------------
+  PRODUCT_LINE_COMPARE_GRAIN — one row per account × product line (baseline/compare)
+
+  Trending CTE uses a focused column list; the final SELECT lists comparison
+  fields + movement flags. For every raw trending attribute at baseline and
+  compare in one Tableau source, use
+  shelfware_tableau_trending_compare_full_columns_long.sql (Extract E).
+
+  Line-level movement columns (line_movement, line_exit_depth) use full grain.
+  Swap / account swap flags use sub_category rollups only (join to
+  swap_accounts_subcat). IS_SELA is only on TRENDING_LONG for Tableau filters.
+  ACCT_NM is council acct_nm joined to trending rows on account_id (not from
+  the trending view as the name source).
+------------------------------------------------------------------------------*/
+WITH params AS (
+  SELECT
+    DATE '2026-01-01' AS dt_baseline,
+    DATE '2026-03-01' AS dt_compare,
+    TRUE AS require_dest_absent_in_baseline
+),
+
+target_accounts AS (
+  SELECT DISTINCT tl.account_id
+  FROM SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 tl
+  WHERE tl.account_id IS NOT NULL
+),
+
+council_dedup AS (
+  SELECT c.*
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.ATTRITION_COUNCIL_DATASET_VW c
+  INNER JOIN target_accounts ta ON c.acct_id = ta.account_id
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY c.acct_id, COALESCE(c.renewal_opty_id, c.renewal_opty_id_18)
+      ORDER BY c.renewal_dt DESC NULLS LAST
+    ) = 1
+),
+
+/* Council acct_nm per account_id — join to trending on account_id */
+council_acct_nm AS (
+  SELECT
+    c.acct_id AS account_id,
+    MAX(c.acct_nm) AS account_name
+  FROM council_dedup c
+  GROUP BY c.acct_id
+),
+
+trending AS (
+  SELECT
+    t.account_id,
+    nm.account_name, /* council via account_id, not trending view name */
+    t.sub_category,
+    t.sub_capability,
+    t.custom_l1,
+    t.sales_ou,
+    t.numerator,
+    t.denominator,
+    t.snapshot_dt::DATE AS snapshot_dt,
+    t.shelfware,
+    t.pov,
+    t.pov_at_risk
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+  INNER JOIN target_accounts ta ON t.account_id = ta.account_id
+  LEFT JOIN council_acct_nm nm ON nm.account_id = t.account_id
+  CROSS JOIN params p
+  WHERE t.snapshot_dt::DATE IN (p.dt_baseline, p.dt_compare)
+),
+
+baseline AS (
+  SELECT t.* FROM trending t CROSS JOIN params p WHERE t.snapshot_dt = p.dt_baseline
+),
+
+latest AS (
+  SELECT t.* FROM trending t CROSS JOIN params p WHERE t.snapshot_dt = p.dt_compare
+),
+
+baseline_subcat AS (
+  SELECT
+    b.account_id,
+    b.sub_category,
+    SUM(ZEROIFNULL(b.pov)) AS pov_baseline,
+    SUM(ZEROIFNULL(b.pov_at_risk)) AS pov_at_risk_baseline,
+    SUM(ZEROIFNULL(b.shelfware)) AS shelfware_baseline,
+    SUM(ZEROIFNULL(b.numerator)) AS numerator_baseline,
+    SUM(ZEROIFNULL(b.denominator)) AS denominator_baseline
+  FROM baseline b
+  GROUP BY b.account_id, b.sub_category
+),
+
+latest_subcat AS (
+  SELECT
+    l.account_id,
+    l.sub_category,
+    SUM(ZEROIFNULL(l.pov)) AS pov_latest,
+    SUM(ZEROIFNULL(l.pov_at_risk)) AS pov_at_risk_latest,
+    SUM(ZEROIFNULL(l.shelfware)) AS shelfware_latest,
+    SUM(ZEROIFNULL(l.numerator)) AS numerator_latest,
+    SUM(ZEROIFNULL(l.denominator)) AS denominator_latest
+  FROM latest l
+  GROUP BY l.account_id, l.sub_category
+),
+
+detail_subcat AS (
+  SELECT
+    COALESCE(b.account_id, l.account_id) AS account_id,
+    COALESCE(b.sub_category, l.sub_category) AS sub_category,
+    b.pov_baseline,
+    l.pov_latest,
+    b.pov_at_risk_baseline,
+    l.pov_at_risk_latest,
+    b.shelfware_baseline,
+    l.shelfware_latest,
+    b.numerator_baseline,
+    l.numerator_latest,
+    b.denominator_baseline,
+    l.denominator_latest,
+    CASE
+      WHEN b.account_id IS NULL THEN 'Compare_only'
+      WHEN l.account_id IS NULL THEN 'Baseline_only'
+      ELSE 'Both_dates'
+    END AS period_coverage
+  FROM baseline_subcat b
+  FULL OUTER JOIN latest_subcat l
+    ON b.account_id = l.account_id
+   AND EQUAL_NULL(b.sub_category, l.sub_category)
+),
+
+from_line_subcat AS (
+  SELECT *
+  FROM detail_subcat
+  WHERE ZEROIFNULL(pov_baseline) > 0
+    AND ZEROIFNULL(pov_latest) = 0
+    AND period_coverage IN ('Both_dates', 'Baseline_only')
+),
+
+to_line_subcat AS (
+  SELECT *
+  FROM detail_subcat
+  WHERE (period_coverage = 'Both_dates'
+         AND ZEROIFNULL(pov_baseline) = 0
+         AND ZEROIFNULL(pov_latest) > 0)
+     OR (period_coverage = 'Compare_only'
+         AND ZEROIFNULL(pov_latest) > 0)
+),
+
+to_line_for_swap_subcat AS (
+  SELECT t.*
+  FROM to_line_subcat t
+  CROSS JOIN params p
+  WHERE NOT p.require_dest_absent_in_baseline
+     OR t.period_coverage = 'Compare_only'
+),
+
+swap_accounts_subcat AS (
+  SELECT DISTINCT f.account_id
+  FROM from_line_subcat f
+  WHERE EXISTS (
+    SELECT 1
+    FROM to_line_for_swap_subcat x
+    WHERE x.account_id = f.account_id
+  )
+),
+
+subcat_exit_rows AS (
+  SELECT DISTINCT account_id, sub_category
+  FROM from_line_subcat
+),
+
+subcat_to_swap_rows AS (
+  SELECT DISTINCT account_id, sub_category
+  FROM to_line_for_swap_subcat
+),
+
+detail AS (
+  SELECT
+    COALESCE(b.account_id, l.account_id) AS account_id,
+    COALESCE(b.account_name, l.account_name) AS account_name,
+    COALESCE(b.sub_category, l.sub_category) AS sub_category,
+    COALESCE(b.sub_capability, l.sub_capability) AS sub_capability,
+    COALESCE(b.custom_l1, l.custom_l1) AS custom_l1,
+    b.sales_ou AS sales_ou_baseline,
+    l.sales_ou AS sales_ou_latest,
+    b.numerator AS numerator_baseline,
+    l.numerator AS numerator_latest,
+    b.denominator AS denominator_baseline,
+    l.denominator AS denominator_latest,
+    b.shelfware AS shelfware_baseline,
+    l.shelfware AS shelfware_latest,
+    b.pov AS pov_baseline,
+    l.pov AS pov_latest,
+    b.pov_at_risk AS pov_at_risk_baseline,
+    l.pov_at_risk AS pov_at_risk_latest,
+    CASE
+      WHEN b.account_id IS NULL THEN 'Compare_only'
+      WHEN l.account_id IS NULL THEN 'Baseline_only'
+      ELSE 'Both_dates'
+    END AS period_coverage
+  FROM baseline b
+  FULL OUTER JOIN latest l
+    ON b.account_id = l.account_id
+   AND EQUAL_NULL(b.sub_category, l.sub_category)
+   AND EQUAL_NULL(b.sub_capability, l.sub_capability)
+   AND EQUAL_NULL(b.custom_l1, l.custom_l1)
+)
+
+SELECT
+  (SELECT pr.dt_baseline FROM params pr) AS snapshot_baseline_dt,
+  (SELECT pr.dt_compare FROM params pr) AS snapshot_compare_dt,
+  d.account_id,
+  d.account_name AS ACCT_NM,
+  d.sub_category,
+  d.sub_capability,
+  d.custom_l1,
+  d.sales_ou_baseline,
+  d.sales_ou_latest,
+  d.numerator_baseline,
+  d.numerator_latest,
+  d.denominator_baseline,
+  d.denominator_latest,
+  d.pov_baseline,
+  d.pov_at_risk_baseline,
+  d.pov_latest,
+  d.pov_at_risk_latest,
+  d.shelfware_baseline,
+  d.shelfware_latest,
+  d.period_coverage,
+  CASE
+    WHEN d.period_coverage = 'Both_dates' THEN ZEROIFNULL(d.pov_latest) - ZEROIFNULL(d.pov_baseline)
+    WHEN d.period_coverage = 'Compare_only' THEN ZEROIFNULL(d.pov_latest)
+    WHEN d.period_coverage = 'Baseline_only' THEN -ZEROIFNULL(d.pov_baseline)
+    ELSE NULL
+  END AS pov_change_amount,
+  CASE
+    WHEN d.period_coverage = 'Both_dates' THEN ZEROIFNULL(d.pov_at_risk_latest) - ZEROIFNULL(d.pov_at_risk_baseline)
+    WHEN d.period_coverage = 'Compare_only' THEN ZEROIFNULL(d.pov_at_risk_latest)
+    WHEN d.period_coverage = 'Baseline_only' THEN -ZEROIFNULL(d.pov_at_risk_baseline)
+    ELSE NULL
+  END AS pov_at_risk_change_amount,
+  CASE
+    WHEN d.period_coverage = 'Compare_only' AND ZEROIFNULL(d.pov_latest) > 0 THEN 'New_line_compare_only'
+    WHEN d.period_coverage = 'Baseline_only' AND ZEROIFNULL(d.pov_baseline) > 0 THEN 'Baseline_only_gone_by_compare'
+    WHEN d.period_coverage = 'Baseline_only' THEN 'Baseline_only_zero_compare'
+    WHEN d.period_coverage = 'Both_dates' AND ZEROIFNULL(d.pov_baseline) > 0 AND ZEROIFNULL(d.pov_latest) > 0 THEN 'Pov_both_dates'
+    WHEN d.period_coverage = 'Both_dates' AND ZEROIFNULL(d.pov_baseline) > 0 AND ZEROIFNULL(d.pov_latest) = 0 THEN 'Full_line_exit'
+    WHEN d.period_coverage = 'Both_dates' AND ZEROIFNULL(d.pov_baseline) = 0 AND ZEROIFNULL(d.pov_latest) > 0 THEN 'New_pov_on_paired_line'
+    WHEN d.period_coverage = 'Both_dates' AND ZEROIFNULL(d.pov_baseline) = 0 AND ZEROIFNULL(d.pov_latest) = 0 THEN 'Zero_pov_both_dates'
+    ELSE 'Other'
+  END AS line_movement,
+  CASE
+    WHEN d.period_coverage = 'Both_dates'
+         AND ZEROIFNULL(d.pov_baseline) > ZEROIFNULL(d.pov_latest)
+         AND ZEROIFNULL(d.pov_latest) > 0 THEN 'Partial_exit_same_line'
+    WHEN d.period_coverage = 'Both_dates'
+         AND ZEROIFNULL(d.pov_baseline) > 0
+         AND ZEROIFNULL(d.pov_latest) = 0 THEN 'Full_exit_same_line'
+    WHEN d.period_coverage = 'Both_dates'
+         AND ZEROIFNULL(d.pov_baseline) = 0
+         AND ZEROIFNULL(d.pov_latest) > 0 THEN 'New_on_line'
+    ELSE 'N_a'
+  END AS line_exit_depth,
+  IFF(sg.account_id IS NOT NULL, TRUE, FALSE) AS account_has_subcategory_swap,
+  IFF(sfx.account_id IS NOT NULL, TRUE, FALSE) AS is_subcategory_exit_row,
+  IFF(
+    sg.account_id IS NOT NULL AND sfx.account_id IS NOT NULL,
+    TRUE,
+    FALSE
+  ) AS is_subcategory_exit_row_on_swap_account,
+  IFF(stx.account_id IS NOT NULL, TRUE, FALSE) AS is_subcategory_to_row
+FROM detail d
+LEFT JOIN swap_accounts_subcat sg ON sg.account_id = d.account_id
+LEFT JOIN subcat_exit_rows sfx
+  ON sfx.account_id = d.account_id
+ AND EQUAL_NULL(sfx.sub_category, d.sub_category)
+LEFT JOIN subcat_to_swap_rows stx
+  ON stx.account_id = d.account_id
+ AND EQUAL_NULL(stx.sub_category, d.sub_category)
+ORDER BY d.account_id, d.sub_category, d.sub_capability, d.custom_l1, d.period_coverage
+;
