@@ -1,0 +1,71 @@
+WITH params AS (
+  SELECT
+    DATE '2026-01-01' AS dt_beginning,
+    DATE '2026-03-01' AS dt_current
+),
+
+swap_target_oppty AS (
+  SELECT DISTINCT
+    t.account_id,
+    t.opportunity_id,
+    op.renewal_opty_nm AS opportunity_name,
+    op.manager_notes,
+    op.next_steps
+  FROM sse_dm_csg_rpt_prd.renewals.ci_near_realtime_renewal_opty_vw op
+  INNER JOIN SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.SHELFWARE_TARGET_LIST_FY27 t
+    ON op.renewal_opty_id = t.opportunity_id
+  WHERE op.renewal_fiscal_qtr = 'FY2027Q1'
+    AND (
+      op.renewal_opty_nm LIKE '%swap%' OR op.renewal_opty_nm LIKE '%Swap%'
+      OR op.manager_notes LIKE '%swap%' OR op.manager_notes LIKE '%Swap%'
+      OR op.next_steps LIKE '%swap%' OR op.next_steps LIKE '%Swap%'
+    )
+),
+
+scoped_accounts AS (
+  SELECT DISTINCT account_id
+  FROM swap_target_oppty
+),
+
+subcat_pov AS (
+  SELECT
+    t.account_id,
+    t.sub_category,
+    t.sales_ou,
+    SUM(IFF(t.snapshot_dt::DATE = (SELECT dt_beginning FROM params), ZEROIFNULL(t.pov), 0)) AS pov_beginning,
+    SUM(IFF(t.snapshot_dt::DATE = (SELECT dt_current   FROM params), ZEROIFNULL(t.pov), 0)) AS pov_current
+  FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+  INNER JOIN scoped_accounts a
+    ON a.account_id = t.account_id
+  WHERE t.snapshot_dt::DATE IN ((SELECT dt_beginning FROM params), (SELECT dt_current FROM params))
+  GROUP BY 1,2,3
+),
+
+subcat_flags AS (
+  SELECT
+    s.account_id,
+    s.sub_category,
+    s.sales_ou,
+    s.pov_beginning,
+    s.pov_current,
+    s.pov_current - s.pov_beginning AS pov_change,
+    IFF(s.pov_beginning > 0 AND s.pov_current = 0, 1, 0) AS is_full_exit_subcat,
+    IFF(s.pov_beginning > 0 AND s.pov_current > 0 AND s.pov_current < s.pov_beginning, 1, 0) AS is_partial_exit_subcat,
+    IFF(s.pov_beginning = 0 AND s.pov_current > 0, 1, 0) AS is_new_add_subcat,
+    IFF(s.pov_beginning > 0 AND s.pov_current > s.pov_beginning, 1, 0) AS is_increase_subcat
+  FROM subcat_pov s
+)
+
+SELECT
+  f.account_id,
+  f.sub_category,
+  f.sales_ou,
+  f.pov_beginning,
+  f.pov_current,
+  f.pov_change,
+  f.is_full_exit_subcat,
+  f.is_partial_exit_subcat,
+  f.is_new_add_subcat,
+  f.is_increase_subcat
+FROM subcat_flags f
+ORDER BY f.account_id, f.sub_category
