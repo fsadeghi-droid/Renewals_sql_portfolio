@@ -1,0 +1,211 @@
+ WITH
+    /* Step 1: Signature Pricing Health account IDs for Q1 and Q2 renewals */
+    sig_accounts AS (
+        SELECT DISTINCT
+            opt.acct_id                                AS account_id,
+            LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) AS opp_id_15
+        FROM SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_participant_vw pp
+        JOIN SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_vw p
+            ON pp.requested_program = p.ID
+        LEFT JOIN EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+            ON LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) =
+  LEFT(opt.opty_id, 15)
+           AND opt.curr_rec_flg = 'Y'
+           AND opt.del_flg = 'N'
+        WHERE p.program_type = 'Renewals'
+          AND p.name LIKE '%RP-FY27%'
+          AND p.name LIKE '%Signature Pricing Health%'
+          AND MONTH(opt.CLSD_DT) IN (2, 3, 4, 5, 6, 7)
+    ),
+
+    /* Step 2: Renewal detail for Sales OU mapping */
+    renewal_detail AS (
+        SELECT
+            LEFT(r.RENEWAL_OPTY_ID, 15) AS opp_id_15,
+            r.ACCOUNT_LVL_2_USR_ROLE,
+            r.ACCOUNT_LVL_3_USR_ROLE,
+            r.ACCOUNT_LVL_4_USR_ROLE,
+            r.ACCOUNT_LVL_5_USR_ROLE,
+            r.BOOK_OF_BUSINESS
+        FROM SSE_DM_CSG_RPT_PRD.RENEWALS.CI_RENEWAL_OPTY_DAILY_SNAP_VW r
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY LEFT(r.RENEWAL_OPTY_ID, 15)
+            ORDER BY r.SNAP_DATE DESC
+        ) = 1
+    ),
+
+    /* Step 3: Sales OU mapping */
+    sales_leader_mapping AS (
+        SELECT
+            opp_id_15,
+            CASE
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'AMER - REG - PRESIDENT' AND
+  BOOK_OF_BUSINESS NOT IN ('MuleSoft') THEN 'AMER REG'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'AMER - TMT - EVP' AND
+  BOOK_OF_BUSINESS NOT IN ('MuleSoft') THEN 'AMER TMT'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'AMER - CBS - EVP' AND
+  BOOK_OF_BUSINESS NOT IN ('MuleSoft') THEN 'AMER CBS'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'AMER - PACE - PRESIDENT' AND
+  BOOK_OF_BUSINESS NOT IN ('MuleSoft') THEN 'AMER PACE'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'EMEA - CENTRAL - EVP' AND
+  BOOK_OF_BUSINESS NOT IN ('MuleSoft') THEN 'EMEA Central'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'EMEA - NORTH - EVP' AND
+  BOOK_OF_BUSINESS NOT IN ('MuleSoft') THEN 'EMEA North'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'EMEA - SOUTH - EVP' AND
+  BOOK_OF_BUSINESS NOT IN ('MuleSoft') THEN 'EMEA South'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'EMEA - FRANCE - EVP' AND
+  BOOK_OF_BUSINESS NOT IN ('MuleSoft') THEN 'France'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'UKI - CEO' AND BOOK_OF_BUSINESS
+  NOT IN ('MuleSoft') THEN 'UKI'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'LATAM - EVP' AND BOOK_OF_BUSINESS
+  NOT IN ('MuleSoft') THEN 'LATAM'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'ANZ - EVP' AND BOOK_OF_BUSINESS
+  NOT IN ('MuleSoft') THEN 'ANZ'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'JP - PRESIDENT' THEN 'North Asia'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'SASIA - CEO' THEN 'South Asia'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'SMB - EVP' AND BOOK_OF_BUSINESS
+  NOT IN ('MuleSoft') THEN 'SMB'
+                WHEN ACCOUNT_LVL_2_USR_ROLE = 'PS - PRESIDENT' THEN
+  'PubSec+.org'
+                WHEN BOOK_OF_BUSINESS IN ('MuleSoft')
+                     AND (ACCOUNT_LVL_2_USR_ROLE NOT IN ('PS - PRESIDENT','JP - 
+  PRESIDENT','SASIA - CEO','GCR - SVP')
+                          AND ACCOUNT_LVL_2_USR_ROLE IS NOT NULL)
+                     THEN 'Data Foundations'
+                ELSE 'Other'
+            END AS sales_ou
+        FROM renewal_detail
+    ),
+
+    /* Step 4: Baseline AOV — closest snapshot on or before 2026-02-01 */
+    baseline_aov AS (
+        SELECT
+            account_id,
+            account_nm,
+            snapshot_dt,
+            SUM(snap_signature_aov) AS baseline_snap_signature_aov,
+            SUM(actual_aov)         AS baseline_actual_aov,
+            ROW_NUMBER() OVER (
+                PARTITION BY account_id
+                ORDER BY snapshot_dt DESC
+            ) AS rn
+        FROM SSE_DM_CSG_RPT_PRD.ci_secured.dev_ci_fact_metrics_sc_aov_vw_v12
+        WHERE snapshot_dt <= '2026-02-01'
+          AND l2_support = 'Signature'
+          AND account_id IN (SELECT account_id FROM sig_accounts)
+        GROUP BY 1, 2, 3
+    ),
+
+    /* Step 5: Latest AOV — most recent snapshot after 2026-02-01 */
+    latest_aov AS (
+        SELECT
+            account_id,
+            account_nm,
+            snapshot_dt,
+            SUM(snap_signature_aov) AS latest_snap_signature_aov,
+            SUM(actual_aov)         AS latest_actual_aov,
+            ROW_NUMBER() OVER (
+                PARTITION BY account_id
+                ORDER BY snapshot_dt DESC
+            ) AS rn
+        FROM SSE_DM_CSG_RPT_PRD.ci_secured.dev_ci_fact_metrics_sc_aov_vw_v12
+        WHERE snapshot_dt > '2026-02-01'
+          AND l2_support = 'Signature'
+          AND account_id IN (SELECT account_id FROM sig_accounts)
+        GROUP BY 1, 2, 3
+    ),
+
+    /* Step 6: Join everything together */
+    base AS (
+        SELECT
+            COALESCE(b.account_id, l.account_id)    AS account_id,
+            COALESCE(b.account_nm, l.account_nm)    AS account_nm,
+            m.sales_ou,
+
+            b.snapshot_dt                           AS baseline_snapshot_dt,
+            l.snapshot_dt                           AS latest_snapshot_dt,
+
+            b.baseline_snap_signature_aov,
+            l.latest_snap_signature_aov,
+            ROUND(
+                IFNULL(l.latest_snap_signature_aov, 0) -
+  IFNULL(b.baseline_snap_signature_aov, 0)
+            , 2)                                    AS
+  snap_signature_aov_change,
+            ROUND(
+                (IFNULL(l.latest_snap_signature_aov, 0) -
+  IFNULL(b.baseline_snap_signature_aov, 0))
+                / NULLIF(ABS(b.baseline_snap_signature_aov), 0) * 100
+            , 2)                                    AS
+  snap_signature_aov_pct_change,
+
+            b.baseline_actual_aov,
+            l.latest_actual_aov,
+            ROUND(
+                IFNULL(l.latest_actual_aov, 0) - IFNULL(b.baseline_actual_aov,
+  0)
+            , 2)                                    AS actual_aov_change,
+            ROUND(
+                (IFNULL(l.latest_actual_aov, 0) - IFNULL(b.baseline_actual_aov,
+  0))
+                / NULLIF(ABS(b.baseline_actual_aov), 0) * 100
+            , 2)                                    AS actual_aov_pct_change
+
+        FROM baseline_aov b
+        FULL OUTER JOIN latest_aov l
+            ON b.account_id = l.account_id
+        LEFT JOIN sig_accounts sa
+            ON COALESCE(b.account_id, l.account_id) = sa.account_id
+        LEFT JOIN sales_leader_mapping m
+            ON sa.opp_id_15 = m.opp_id_15
+        WHERE COALESCE(b.rn, 1) = 1
+          AND COALESCE(l.rn, 1) = 1
+    )
+
+  SELECT
+      sales_ou,
+      account_id,
+      account_nm,
+      baseline_snapshot_dt,
+      latest_snapshot_dt,
+
+      baseline_snap_signature_aov,
+      latest_snap_signature_aov,
+      snap_signature_aov_change,
+      snap_signature_aov_pct_change,
+
+      baseline_actual_aov,
+      latest_actual_aov,
+      actual_aov_change,
+      actual_aov_pct_change,
+
+      /* Summary metrics by Sales OU */
+      COUNT(DISTINCT account_id) OVER (PARTITION BY sales_ou)
+                            AS total_tagged_accounts_by_ou,
+      COUNT(DISTINCT CASE WHEN IFNULL(latest_snap_signature_aov, 0) > 0
+                          THEN account_id END) OVER (PARTITION BY sales_ou)
+                            AS accounts_still_with_signature_by_ou,
+      ROUND(
+          COUNT(DISTINCT CASE WHEN IFNULL(latest_snap_signature_aov, 0) > 0
+                              THEN account_id END) OVER (PARTITION BY sales_ou)
+          / NULLIF(COUNT(DISTINCT account_id) OVER (PARTITION BY sales_ou), 0) *
+  100
+      , 1)
+                            AS pct_accounts_still_with_signature_by_ou,
+
+      /* Grand total across all OUs */
+      COUNT(DISTINCT account_id) OVER ()
+                            AS total_tagged_accounts_overall,
+      COUNT(DISTINCT CASE WHEN IFNULL(latest_snap_signature_aov, 0) > 0
+                          THEN account_id END) OVER ()
+                            AS accounts_still_with_signature_overall,
+      ROUND(
+          COUNT(DISTINCT CASE WHEN IFNULL(latest_snap_signature_aov, 0) > 0
+                              THEN account_id END) OVER ()
+          / NULLIF(COUNT(DISTINCT account_id) OVER (), 0) * 100
+      , 1)
+                            AS pct_accounts_still_with_signature_overall
+
+  FROM base
+  ORDER BY sales_ou, account_id
+
