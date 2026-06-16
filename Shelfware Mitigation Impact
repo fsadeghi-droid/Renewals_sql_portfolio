@@ -1,0 +1,118 @@
+WITH
+    /* Shelfware Mitigation program accounts */
+    shelfware_accounts AS (
+        SELECT DISTINCT
+            opt.acct_id AS account_id
+        FROM SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_participant_vw pp
+        JOIN SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_vw p
+            ON pp.requested_program = p.ID
+        LEFT JOIN EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+            ON LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) =
+  LEFT(opt.opty_id, 15)
+           AND opt.curr_rec_flg = 'Y'
+           AND opt.del_flg = 'N'
+        WHERE p.program_type = 'Renewals'
+          AND p.name LIKE '%RP-FY27%'
+          AND p.name LIKE '%Shelfware Mitigation%'
+    ),
+
+    /* Closest snapshot on or before 2026-05-01 per account */
+    baseline_dates AS (
+        SELECT
+            t.account_id,
+            MAX(t.snapshot_dt::DATE) AS baseline_dt
+        FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+        INNER JOIN shelfware_accounts sa ON t.account_id = sa.account_id
+        WHERE t.snapshot_dt::DATE <= '2026-04-01'
+        GROUP BY t.account_id
+    ),
+
+    /* Most recent snapshot per account */
+    latest_dates AS (
+        SELECT
+            t.account_id,
+            MAX(t.snapshot_dt::DATE) AS latest_dt
+        FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+        INNER JOIN shelfware_accounts sa ON t.account_id = sa.account_id
+        GROUP BY t.account_id
+    ),
+
+    /* Baseline shelfware aggregated per account across all product lines */
+    baseline_agg AS (
+        SELECT
+            t.account_id,
+            MAX(t.sales_ou)              AS sales_ou,
+            bd.baseline_dt               AS snapshot_dt,
+            SUM(ZEROIFNULL(t.shelfware)) AS shelfware_baseline,
+            SUM(ZEROIFNULL(t.pov))       AS pov_baseline
+        FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+        INNER JOIN baseline_dates bd
+            ON t.account_id = bd.account_id
+           AND t.snapshot_dt::DATE = bd.baseline_dt
+        GROUP BY t.account_id, bd.baseline_dt
+    ),
+
+    /* Latest shelfware aggregated per account across all product lines */
+    latest_agg AS (
+        SELECT
+            t.account_id,
+            MAX(t.sales_ou)              AS sales_ou,
+            ld.latest_dt                 AS snapshot_dt,
+            SUM(ZEROIFNULL(t.shelfware)) AS shelfware_latest,
+            SUM(ZEROIFNULL(t.pov))       AS pov_latest
+        FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
+        INNER JOIN latest_dates ld
+            ON t.account_id = ld.account_id
+           AND t.snapshot_dt::DATE = ld.latest_dt
+        GROUP BY t.account_id, ld.latest_dt
+    ),
+
+    /* Account-level detail */
+    account_detail AS (
+        SELECT
+            COALESCE(b.account_id,  l.account_id)  AS account_id,
+            COALESCE(l.sales_ou,    b.sales_ou)    AS sales_ou,   -- prefer latest OU
+            b.snapshot_dt                          AS baseline_snapshot_dt,
+            l.snapshot_dt                          AS latest_snapshot_dt,
+            ZEROIFNULL(b.shelfware_baseline)        AS shelfware_baseline,
+            ZEROIFNULL(l.shelfware_latest)          AS shelfware_latest,
+            ZEROIFNULL(b.pov_baseline)              AS pov_baseline,
+            ZEROIFNULL(l.pov_latest)                AS pov_latest
+        FROM baseline_agg b
+        FULL OUTER JOIN latest_agg l
+            ON b.account_id = l.account_id
+    )
+
+  SELECT
+      sales_ou,
+      MIN(baseline_snapshot_dt)                                              AS
+  baseline_snapshot_dt,
+      MAX(latest_snapshot_dt)                                                AS
+  latest_snapshot_dt,
+
+      COUNT(DISTINCT account_id)                                             AS
+  account_count,
+
+      ROUND(SUM(shelfware_baseline), 2)                                      AS
+  shelfware_aov_baseline,
+      ROUND(SUM(shelfware_latest),   2)                                      AS
+  shelfware_aov_latest,
+
+      ROUND(SUM(shelfware_latest) - SUM(shelfware_baseline), 2)              AS
+  shelfware_aov_change,
+      ROUND(
+          (SUM(shelfware_latest) - SUM(shelfware_baseline))
+          / NULLIF(ABS(SUM(shelfware_baseline)), 0) * 100
+      , 1)                                                                   AS
+  shelfware_aov_pct_change,
+
+      ROUND(SUM(pov_baseline), 2)                                            AS
+  pov_baseline,
+      ROUND(SUM(pov_latest),   2)                                            AS
+  pov_latest,
+      ROUND(SUM(pov_latest) - SUM(pov_baseline), 2)                          AS
+  pov_change
+
+  FROM account_detail
+  GROUP BY sales_ou
+  ORDER BY shelfware_aov_change ASC
