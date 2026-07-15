@@ -1,0 +1,56 @@
+--Generate staging table to hold snapshot dates | currently set for every day - adjusting date ranges depending on forecast range
+WITH SNAP_STG_1 AS (
+SELECT
+    dt.DIM_DT_KY SNAPSHOT_DT,
+    dt.DIM_DT_KY SNAP_END_DT,
+    dt.DIM_DT_KY SNAP_STRT_DT
+FROM EDW_HERITAGE_PRD.DM.DIM_DATE_VW dt
+WHERE
+    dt.DIM_DT_KY BETWEEN '2023-07-01' AND sysdate()
+)
+
+SELECT DISTINCT
+    dt.SNAPSHOT_DT,
+    opt.acct_id,
+    opt.OPTY_ID,
+    opt.CLSD_DT,
+    opt.REC_END_DT,
+    opt.REC_STRT_DT,
+    opt.opty_nm,
+    b.csg_territory,
+    opt.recordtypeid,
+    opt.MGR_FORCST_JUDG_TXT,
+    TRUNC(opt.CLSD_DT,'month') CLOSE_MONTH,
+    ROUND(opt.PRI_ANL_CNTR_VAL_NM * crncy.conv_rt,2) ATR_CONV,
+    ROUND(opt.AMT * crncy.conv_rt,2) AMT_CONV,
+    ROUND(opt.converted_swing_amt * crncy.conv_rt,2) CONV_SWING,
+    ROUND(opt.FORCST_ATTRTN_AMT * crncy.conv_rt,2) FCAST_ATTRITION_CONV,
+    DATEDIFF(day,opt.CLSD_DT,dt.SNAPSHOT_DT) DAY_DIFF,
+    ROW_NUMBER() OVER (PARTITION BY opt.OPTY_ID ORDER BY opt.REC_END_DT DESC) RN
+FROM EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+LEFT JOIN (SELECT DISTINCT fm_crncy_cd, conv_rt FROM EDW_HERITAGE_PRD.DM.DIM_EXCHANGE_RATE_MO_VW_VW WHERE to_crncy_cd = 'USD' AND conv_typ = 'Outlook' AND conv_prd_nm = to_char(current_date, 'Mon-YY')) crncy ON opt.crncy_cd = crncy.fm_crncy_cd
+LEFT JOIN SSE_DM_CSG_RPT_PRD.CIDM.CI_DIM_ACCOUNT_VW b ON opt.ACCT_ID = b.account_id
+/*LEFT JOIN (SELECT 
+                RENEWAL_OPTY_ID
+            FROM RENEWALS.WV_CI_RENEWAL_OPTY_VW
+            WHERE
+                
+            )c ON opt.opty_id = c.renewal_opty_id_18
+*/
+---Cross Join for Snap Dates---
+CROSS JOIN SNAP_STG_1 dt 
+WHERE 
+---Select intial Opty ID for Testing---
+     opt.opty_id = '006ed00000CkW4PAAV'
+    --AND c.RENEWAL_CLSD_DT BETWEEN '2024-02-01' AND '2025-01-31'
+---Limit records for Snaps when Record is Active
+    AND dt.SNAPSHOT_DT BETWEEN opt.REC_STRT_DT AND CASE WHEN opt.REC_END_DT = '9999-12-31 00:00:00.000' THEN sysdate() ELSE opt.REC_END_DT END    
+    --AND DATEDIFF(day,opt.CLSD_DT,dt.SNAPSHOT_DT) >= -180 AND DATEDIFF(day,opt.CLSD_DT,dt.SNAPSHOT_DT) <= 2
+    AND opt.forcst_cat_cd <> 'Omitted'
+    AND (opt.opty_typ = 'Renewal' OR opt.opty_typ = 'Contract' OR opt.opty_typ LIKE 'Off-Cycle%' OR  opt.opty_typ LIKE '%ISV%')
+    AND opt.opty_rec_typ_ky IN ('1506','1507')
+    AND opt.targeted_clouds <> 'Slack Unmigrated'
+    AND c.account_nm NOT LIKE 'Renewals Off Cycle Forecasting%'
+    AND (opt.forcst_attrtn_amt <= 0)
+    AND (((opt.X30_DY_EXT_TXT NOT IN ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE') AND opt.OPTY_STG_NM IN ('05 Closed','Dead Attrition')) OR  opt.OPTY_STG_NM NOT IN ('05 Closed','Dead Attrition')) OR opt.X30_DY_EXT_TXT is NULL)
+ORDER BY ROUND(opt.PRI_ANL_CNTR_VAL_NM * crncy.conv_rt,2) DESC
