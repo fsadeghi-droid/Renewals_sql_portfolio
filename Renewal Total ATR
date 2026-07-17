@@ -1,0 +1,167 @@
+USE DATABASE SSE_DM_CSG_RPT_PRD;
+
+WITH filtered_renewals AS (
+    SELECT
+        op.renewal_opty_id_18,
+        op.renewal_fiscal_qtr,
+        op.renewal_fiscal_year,
+        op.renewal_atr_conv,
+        -- Organizational hierarchy columns required for the mapping logic
+        op.account_lvl_2_usr_role,
+        op.account_lvl_3_usr_role,
+        op.account_lvl_4_usr_role,
+        op.account_lvl_5_usr_role,
+        op.book_of_business
+    FROM RENEWALS.ci_near_realtime_renewal_opty_vw op
+    WHERE
+        op.renewal_fiscal_year = 2027 -- Adjusted timeframe to FY2027
+        AND op.m_a_legacy_renewal_flag != 'Y' 
+        AND op.renewal_fcast_code NOT IN ('Omitted')
+        AND (
+            op.renewal_opty_type IN ('Renewal', 'ISV', 'Contract') 
+            OR op.renewal_opty_type LIKE 'Off-Cycle%'
+        )
+        AND op.renewal_fcast_attrition_conv <= 0
+        AND (
+            (
+                op.renewal_30de NOT IN ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE') 
+                AND op.renewal_stg_nm IN ('05 Closed','Dead Attrition')
+            )
+            OR op.renewal_stg_nm NOT IN ('05 Closed','Dead Attrition')
+            OR op.renewal_30de IS NULL
+        )
+),
+
+sales_leader_tier1 AS (
+    SELECT
+        *,
+        CASE
+            WHEN renewal_opty_id_18 = '0063y000016Va6KAAS' THEN 'Other'
+            WHEN account_lvl_2_usr_role = 'AMER - REG - PRESIDENT' AND book_of_business NOT IN ('MuleSoft') THEN 'AMER REG'
+            WHEN account_lvl_2_usr_role = 'AMER - TMT - EVP' AND book_of_business NOT IN ('MuleSoft') THEN 'AMER TMT'
+            WHEN account_lvl_2_usr_role = 'AMER - CBS - EVP' AND book_of_business NOT IN ('MuleSoft') THEN 'AMER CBS'
+            WHEN account_lvl_2_usr_role = 'AMER - PACE - PRESIDENT' AND book_of_business NOT IN ('MuleSoft') THEN 'AMER PACE'
+            WHEN account_lvl_2_usr_role = 'EMEA - CENTRAL - EVP' AND book_of_business NOT IN ('MuleSoft') THEN 'EMEA Central'
+            WHEN account_lvl_2_usr_role = 'EMEA - NORTH - EVP' AND book_of_business NOT IN ('MuleSoft') THEN 'EMEA North'
+            WHEN account_lvl_2_usr_role = 'EMEA - SOUTH - EVP' AND book_of_business NOT IN ('MuleSoft') THEN 'EMEA South'
+            WHEN account_lvl_2_usr_role = 'EMEA - FRANCE - EVP' AND book_of_business NOT IN ('MuleSoft') THEN 'France'
+            WHEN account_lvl_2_usr_role = 'UKI - CEO' AND book_of_business NOT IN ('MuleSoft') THEN 'UKI'
+            WHEN account_lvl_2_usr_role = 'LATAM - EVP' AND book_of_business NOT IN ('MuleSoft') THEN 'LATAM'
+            WHEN account_lvl_2_usr_role = 'ANZ - EVP' AND book_of_business NOT IN ('MuleSoft') THEN 'ANZ'
+            WHEN account_lvl_2_usr_role = 'JP - PRESIDENT' THEN 'North Asia'
+            WHEN account_lvl_2_usr_role = 'SASIA - CEO' THEN 'South Asia'
+            WHEN account_lvl_2_usr_role = 'SMB - EVP' AND book_of_business NOT IN ('MuleSoft') THEN 'SMB'
+            WHEN account_lvl_2_usr_role = 'PS - PRESIDENT' THEN 'PubSec+.org'
+            WHEN book_of_business IN ('MuleSoft')
+                AND (account_lvl_2_usr_role NOT IN ('PS - PRESIDENT','JP - PRESIDENT', 'SASIA - CEO','GCR - SVP') AND account_lvl_2_usr_role IS NOT NULL)
+                THEN 'Data Foundations'
+            ELSE 'Other'
+        END AS Sales_OU,
+        CASE
+            WHEN renewal_opty_id_18 = '0063y000016Va6KAAS' THEN 'Other'
+            WHEN account_lvl_3_usr_role = 'AMER - REG - CAN - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER REG CAN'
+            WHEN account_lvl_3_usr_role = 'AMER - REG - FINS - EVP' AND book_of_business != 'MuleSoft' THEN 'AMER REG FINS'
+            WHEN account_lvl_3_usr_role = 'AMER - REG - HLS - HC - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER REG HLS HC'
+            WHEN account_lvl_3_usr_role = 'AMER - REG - HLS - LS - ENTR - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER REG HLS LS ENTR'
+            WHEN account_lvl_4_usr_role = 'AMER - TMT - ENTR - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER TMT ENTR'
+            WHEN account_lvl_3_usr_role LIKE 'AMER - TMT - STRAT%' AND book_of_business != 'MuleSoft' THEN 'AMER TMT STRAT'
+            WHEN account_lvl_4_usr_role = 'AMER - TMT - CMRCL - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER TMT CMRCL'
+            WHEN account_lvl_3_usr_role = 'AMER - CBS - ENTR - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER CBS ENTR'
+            WHEN account_lvl_3_usr_role = 'AMER - CBS - ENTR - TTH - AVP' AND book_of_business != 'MuleSoft' THEN 'AMER CBS TTH ENTR'
+            WHEN account_lvl_3_usr_role = 'AMER - CBS - CMRCL - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER CBS CMRCL'
+            WHEN account_lvl_3_usr_role = 'AMER - PACE - CMRCL - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER PACE CMRCL'
+            WHEN account_lvl_3_usr_role = 'AMER - PACE - RCG - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER PACE RCG'
+            WHEN account_lvl_3_usr_role = 'AMER - PACE - MAE - ENTR - SVP' AND book_of_business != 'MuleSoft' THEN 'AMER PACE MAE ENTR'
+            WHEN account_lvl_3_usr_role IN ('LATAM - BR - ENTR - SVP') AND book_of_business != 'MuleSoft' THEN 'LATAM BR ENTR'
+            WHEN account_lvl_3_usr_role IN ('LATAM - MX - ENTR - SVP') AND book_of_business != 'MuleSoft' THEN 'LATAM MX ENTR'
+            WHEN account_lvl_3_usr_role IN ('LATAM - CMRCL - SVP') AND book_of_business != 'MuleSoft' THEN 'LATAM CMRCL'
+            WHEN account_lvl_3_usr_role IN ('LATAM - GRW - ENTR - AR - AVP') AND book_of_business != 'MuleSoft' THEN 'LATAM GRW ENTR AR'
+            WHEN account_lvl_3_usr_role IN ('LATAM - GRW - ENTR - CL - PE - AVP') AND book_of_business != 'MuleSoft' THEN 'LATAM GRW ENTR CL PE'
+            WHEN account_lvl_3_usr_role IN ('LATAM - GRW - ENTR - CO - AVP') AND book_of_business != 'MuleSoft' THEN 'LATAM GRW ENTR CO'
+            WHEN account_lvl_3_usr_role LIKE 'LATAM - PS - NP%' AND book_of_business != 'MuleSoft' THEN 'LATAM PS NP'
+            WHEN account_lvl_3_usr_role IN ('UKI - ENTR - EVP') AND book_of_business != 'MuleSoft' THEN 'UKI ENTR'
+            WHEN account_lvl_3_usr_role IN ('UKI - CMRCL - SVP') AND book_of_business != 'MuleSoft' THEN 'UKI CMRCL'
+            WHEN account_lvl_3_usr_role IN ('EMEA - CENTRAL - AT - AVP') AND book_of_business != 'MuleSoft' THEN 'EMEA Central AT'
+            WHEN account_lvl_4_usr_role IN ('EMEA - CENTRAL - DE - CMRCL - MM - AVP') AND book_of_business != 'MuleSoft' THEN 'EMEA Central DE CMRCL MM'
+            WHEN account_lvl_4_usr_role IN ('EMEA - CENTRAL - DE - V1 - SVP') AND book_of_business != 'MuleSoft' THEN 'EMEA Central DE V1'
+            WHEN account_lvl_4_usr_role IN ('EMEA - CENTRAL - DE - V2 - SVP') AND book_of_business != 'MuleSoft' THEN 'EMEA Central DE V2'
+            WHEN account_lvl_3_usr_role IN ('EMEA - SOUTH - EGM - SVP') AND book_of_business != 'MuleSoft' THEN 'EMEA South EGM'
+            WHEN account_lvl_3_usr_role IN ('EMEA - SOUTH - IB - SVP') AND book_of_business != 'MuleSoft' THEN 'EMEA South IB'
+            WHEN account_lvl_3_usr_role IN ('EMEA - SOUTH - IT - SVP') AND book_of_business != 'MuleSoft' THEN 'EMEA South IT'
+            WHEN account_lvl_3_usr_role IN ('EMEA - SOUTH - ME - SVP') AND book_of_business != 'MuleSoft' THEN 'EMEA South ME'
+            WHEN account_lvl_3_usr_role IN ('EMEA - FRANCE - SLS - SVP') AND book_of_business != 'MuleSoft' THEN 'France SLS'
+            WHEN account_lvl_3_usr_role IN ('EMEA - NORTH - BELUX - AVP') AND book_of_business != 'MuleSoft' THEN 'EMEA North BELUX'
+            WHEN account_lvl_3_usr_role IN ('EMEA - NORTH - NL - SVP') AND book_of_business != 'MuleSoft' THEN 'EMEA North NL'
+            WHEN account_lvl_3_usr_role IN ('EMEA - NORTH - NOR - SVP') AND book_of_business != 'MuleSoft' THEN 'EMEA North NOR'
+            WHEN account_lvl_3_usr_role IN ('EMEA - NORTH - CH - SVP') AND book_of_business != 'MuleSoft' THEN 'EMEA North CH'
+            WHEN account_lvl_3_usr_role IN ('ANZ - AU - CMRCL - MGR') AND book_of_business != 'MuleSoft' THEN 'ANZ AU CMRCL'
+            WHEN account_lvl_3_usr_role IN ('ANZ - AU - ENTR - MGR') AND book_of_business != 'MuleSoft' THEN 'ANZ AU ENTR SCALE'
+            WHEN account_lvl_3_usr_role IN ('ANZ - AU - STRAT - ENTR - MGR') AND book_of_business != 'MuleSoft' THEN 'ANZ AU ENTR STRAT'
+            WHEN account_lvl_3_usr_role IN ('ANZ - NZ - MGR') AND book_of_business != 'MuleSoft' THEN 'ANZ NZ'
+            WHEN account_lvl_3_usr_role IN ('ANZ - SMB - MGR') AND book_of_business != 'MuleSoft' THEN 'ANZ SMB'
+            WHEN account_lvl_4_usr_role IN ('JP - FS - SVP') AND account_lvl_5_usr_role NOT IN ('JP - PS - SVP') THEN 'Japan FS'
+            WHEN account_lvl_5_usr_role IN ('JP - PS - SVP') THEN 'Japan PS'
+            WHEN account_lvl_4_usr_role IN ('JP - SMB - SVP') THEN 'Japan SMB'
+            WHEN account_lvl_3_usr_role IN ('SASIA - EVP') THEN 'South Asia'
+            WHEN account_lvl_4_usr_role IN ('SMB - AMER - ESB - SVP') AND book_of_business != 'MuleSoft' THEN 'SMB AMER ESB'
+            WHEN account_lvl_4_usr_role IN ('SMB - AMER - GRB - GEO - SVP') AND book_of_business != 'MuleSoft' THEN 'SMB AMER GRB GEO'
+            WHEN account_lvl_4_usr_role IN ('SMB - AMER - GRB - IND - SVP') AND book_of_business != 'MuleSoft' THEN 'SMB AMER GRB IND'
+            WHEN account_lvl_4_usr_role IN ('SMB - EMEA - EVP') AND book_of_business != 'MuleSoft' THEN 'SMB EMEA'
+            WHEN account_lvl_4_usr_role IN ('SMB - LATAM - AVP') AND book_of_business != 'MuleSoft' THEN 'SMB LATAM'
+            WHEN account_lvl_3_usr_role IN ('NP - NGO - EVP') THEN 'NP NGO'
+            WHEN account_lvl_3_usr_role IN ('PS - AMER - EVP') THEN 'PS AMER'
+            WHEN account_lvl_3_usr_role IN ('PS - APAC - SVP') THEN 'PS APAC'
+            WHEN account_lvl_3_usr_role IN ('PS - EMEA - SVP') THEN 'PS EMEA'
+            WHEN book_of_business = 'MuleSoft'
+                AND account_lvl_2_usr_role IN ('AMER - REG - PRESIDENT','AMER - TMT - EVP','AMER - CBS - EVP','AMER - PACE - PRESIDENT')
+                THEN 'Data Foundations AMER ENTR & CMRCL'
+            WHEN book_of_business = 'MuleSoft'
+                AND (account_lvl_2_usr_role LIKE 'EMEA%' OR account_lvl_2_usr_role IN ('UKI - CEO','ANZ - EVP','LATAM - EVP'))
+                AND account_lvl_3_usr_role != 'ANZ - SMB - MGR'
+                THEN 'Data Foundations INT ENTR & CMRCL'
+            WHEN book_of_business = 'MuleSoft'
+                AND (account_lvl_2_usr_role IN ('SMB - EVP') OR account_lvl_3_usr_role = 'ANZ - SMB - MGR')
+                THEN 'Data Foundations SMB'
+            ELSE 'Other'
+        END AS sales_OU_1
+    FROM filtered_renewals
+),
+
+sales_leader_mapping AS (
+    SELECT
+        *,
+        CASE
+            WHEN Sales_OU = 'AMER TMT' THEN 1
+            WHEN Sales_OU = 'AMER CBS' THEN 2
+            WHEN Sales_OU = 'AMER REG' THEN 3
+            WHEN Sales_OU = 'AMER PACE' THEN 4
+            WHEN Sales_OU = 'LATAM' THEN 5
+            WHEN Sales_OU = 'EMEA South' THEN 6
+            WHEN Sales_OU = 'UKI' THEN 7
+            WHEN Sales_OU = 'EMEA Central' THEN 8
+            WHEN Sales_OU = 'France' THEN 9
+            WHEN Sales_OU = 'EMEA North' THEN 10
+            WHEN Sales_OU = 'North Asia' THEN 11
+            WHEN Sales_OU = 'South Asia' THEN 12
+            WHEN Sales_OU = 'ANZ' THEN 13
+            WHEN Sales_OU = 'SMB' THEN 14
+            WHEN Sales_OU = 'PubSec+.org' THEN 15
+            WHEN Sales_OU = 'Data Foundations' THEN 16
+            ELSE 17
+        END AS Ord_OU
+    FROM sales_leader_tier1
+)
+
+-- FINAL REPORT Aggregated by OU and Quarter
+SELECT
+    COALESCE(Sales_OU, 'Other') AS "Sales_OU",
+    COALESCE(sales_OU_1, 'Other') AS "Sales_OU_1",
+    SUM(IFNULL(renewal_atr_conv, 0)) AS "Total_FY27_ATR",
+    SUM(CASE WHEN renewal_fiscal_qtr LIKE '%Q1%' OR renewal_fiscal_qtr = '1' THEN IFNULL(renewal_atr_conv, 0) ELSE 0 END) AS "Q1_ATR",
+    SUM(CASE WHEN renewal_fiscal_qtr LIKE '%Q2%' OR renewal_fiscal_qtr = '2' THEN IFNULL(renewal_atr_conv, 0) ELSE 0 END) AS "Q2_ATR",
+    SUM(CASE WHEN renewal_fiscal_qtr LIKE '%Q3%' OR renewal_fiscal_qtr = '3' THEN IFNULL(renewal_atr_conv, 0) ELSE 0 END) AS "Q3_ATR",
+    SUM(CASE WHEN renewal_fiscal_qtr LIKE '%Q4%' OR renewal_fiscal_qtr = '4' THEN IFNULL(renewal_atr_conv, 0) ELSE 0 END) AS "Q4_ATR",
+    COUNT(DISTINCT renewal_opty_id_18) AS "Opportunity_Count"
+FROM sales_leader_mapping
+GROUP BY 1, 2, Ord_OU
+ORDER BY Ord_OU ASC;
