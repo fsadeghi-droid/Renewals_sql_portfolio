@@ -1,118 +1,103 @@
 WITH
-    /* Shelfware Mitigation program accounts */
+    /* 1. Filter accounts tied to Shelfware Mitigation program opportunities closing in Q3 */
     shelfware_accounts AS (
         SELECT DISTINCT
             opt.acct_id AS account_id
         FROM SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_participant_vw pp
         JOIN SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_vw p
             ON pp.requested_program = p.ID
-        LEFT JOIN EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
-            ON LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) =
-  LEFT(opt.opty_id, 15)
+        INNER JOIN EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+            ON LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) = LEFT(opt.opty_id, 15)
            AND opt.curr_rec_flg = 'Y'
            AND opt.del_flg = 'N'
         WHERE p.program_type = 'Renewals'
           AND p.name LIKE '%RP-FY27%'
           AND p.name LIKE '%Shelfware Mitigation%'
+          
+          /* --- Q3 OPPORTUNITY CLOSE DATE FILTER --- */
+          -- Standard Fiscal Year 2027 Q3 (Aug 1, 2026 to Oct 31, 2026)
+          AND opt.clsd_dt >= '2026-05-01' AND opt.clsd_dt <= '2026-7-31'
+          
+          -- ALTERNATIVE: Calendar Q3 (Jul 1, 2026 to Sep 30, 2026)
+          -- AND opt.close_dt >= '2026-07-01' AND opt.close_dt <= '2026-09-30'
+          
+          -- ALTERNATIVE: Fiscal Quarter field (if present in DIM_OPPORTUNITY_VW)
+          -- AND opt.close_fq_num = 3 AND opt.close_fy_num = 2027
     ),
 
-    /* Closest snapshot on or before 2026-05-01 per account */
-    baseline_dates AS (
+    /* 2. Retrieve trending data & tag baseline (<= 2026-04-01) and latest snapshot dates per account */
+    account_snapshots AS (
         SELECT
             t.account_id,
-            MAX(t.snapshot_dt::DATE) AS baseline_dt
+            t.snapshot_dt::DATE AS snapshot_dt,
+            ZEROIFNULL(t.shelfware)   AS shelfware,
+            ZEROIFNULL(t.numerator)   AS numerator,
+            ZEROIFNULL(t.denominator) AS denominator,
+            ZEROIFNULL(t.pov)         AS pov,
+            ZEROIFNULL(t.pov_at_risk) AS pov_at_risk,
+            
+            -- Baseline: Closest snapshot date on or before 2026-04-01 per account
+            MAX(CASE WHEN t.snapshot_dt::DATE <= '2026-04-01' THEN t.snapshot_dt::DATE END) 
+                OVER (PARTITION BY t.account_id) AS baseline_dt,
+            
+            -- Latest: Most recent snapshot date per account
+            MAX(t.snapshot_dt::DATE) 
+                OVER (PARTITION BY t.account_id) AS latest_dt
         FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
-        INNER JOIN shelfware_accounts sa ON t.account_id = sa.account_id
-        WHERE t.snapshot_dt::DATE <= '2026-04-01'
-        GROUP BY t.account_id
+        INNER JOIN shelfware_accounts sa 
+            ON t.account_id = sa.account_id
     ),
 
-    /* Most recent snapshot per account */
-    latest_dates AS (
-        SELECT
-            t.account_id,
-            MAX(t.snapshot_dt::DATE) AS latest_dt
-        FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
-        INNER JOIN shelfware_accounts sa ON t.account_id = sa.account_id
-        GROUP BY t.account_id
-    ),
-
-    /* Baseline shelfware aggregated per account across all product lines */
-    baseline_agg AS (
-        SELECT
-            t.account_id,
-            MAX(t.sales_ou)              AS sales_ou,
-            bd.baseline_dt               AS snapshot_dt,
-            SUM(ZEROIFNULL(t.shelfware)) AS shelfware_baseline,
-            SUM(ZEROIFNULL(t.pov))       AS pov_baseline
-        FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
-        INNER JOIN baseline_dates bd
-            ON t.account_id = bd.account_id
-           AND t.snapshot_dt::DATE = bd.baseline_dt
-        GROUP BY t.account_id, bd.baseline_dt
-    ),
-
-    /* Latest shelfware aggregated per account across all product lines */
-    latest_agg AS (
-        SELECT
-            t.account_id,
-            MAX(t.sales_ou)              AS sales_ou,
-            ld.latest_dt                 AS snapshot_dt,
-            SUM(ZEROIFNULL(t.shelfware)) AS shelfware_latest,
-            SUM(ZEROIFNULL(t.pov))       AS pov_latest
-        FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.POV_WEIGHTED_SHELFWARE_TRENDING_VW t
-        INNER JOIN latest_dates ld
-            ON t.account_id = ld.account_id
-           AND t.snapshot_dt::DATE = ld.latest_dt
-        GROUP BY t.account_id, ld.latest_dt
-    ),
-
-    /* Account-level detail */
+    /* 3. Aggregate product-level rows to the distinct account level for baseline and latest snapshots */
     account_detail AS (
         SELECT
-            COALESCE(b.account_id,  l.account_id)  AS account_id,
-            COALESCE(l.sales_ou,    b.sales_ou)    AS sales_ou,   -- prefer latest OU
-            b.snapshot_dt                          AS baseline_snapshot_dt,
-            l.snapshot_dt                          AS latest_snapshot_dt,
-            ZEROIFNULL(b.shelfware_baseline)        AS shelfware_baseline,
-            ZEROIFNULL(l.shelfware_latest)          AS shelfware_latest,
-            ZEROIFNULL(b.pov_baseline)              AS pov_baseline,
-            ZEROIFNULL(l.pov_latest)                AS pov_latest
-        FROM baseline_agg b
-        FULL OUTER JOIN latest_agg l
-            ON b.account_id = l.account_id
+            account_id,
+            MAX(baseline_dt) AS baseline_snapshot_dt,
+            MAX(latest_dt)   AS latest_snapshot_dt,
+
+            -- Baseline Metrics
+            SUM(CASE WHEN snapshot_dt = baseline_dt THEN shelfware ELSE 0 END)   AS shelfware_baseline,
+            SUM(CASE WHEN snapshot_dt = baseline_dt THEN numerator ELSE 0 END)   AS numerator_baseline,
+            SUM(CASE WHEN snapshot_dt = baseline_dt THEN denominator ELSE 0 END) AS denominator_baseline,
+            SUM(CASE WHEN snapshot_dt = baseline_dt THEN pov ELSE 0 END)         AS pov_baseline,
+            SUM(CASE WHEN snapshot_dt = baseline_dt THEN pov_at_risk ELSE 0 END) AS pov_at_risk_baseline,
+
+            -- Latest Metrics
+            SUM(CASE WHEN snapshot_dt = latest_dt THEN shelfware ELSE 0 END)   AS shelfware_latest,
+            SUM(CASE WHEN snapshot_dt = latest_dt THEN numerator ELSE 0 END)   AS numerator_latest,
+            SUM(CASE WHEN snapshot_dt = latest_dt THEN denominator ELSE 0 END) AS denominator_latest,
+            SUM(CASE WHEN snapshot_dt = latest_dt THEN pov ELSE 0 END)         AS pov_latest,
+            SUM(CASE WHEN snapshot_dt = latest_dt THEN pov_at_risk ELSE 0 END) AS pov_at_risk_latest
+        FROM account_snapshots
+        WHERE snapshot_dt = baseline_dt 
+           OR snapshot_dt = latest_dt
+        GROUP BY account_id
     )
 
-  SELECT
-      sales_ou,
-      MIN(baseline_snapshot_dt)                                              AS
-  baseline_snapshot_dt,
-      MAX(latest_snapshot_dt)                                                AS
-  latest_snapshot_dt,
+/* 4. Portfolio Summary for Q3 Opportunity Accounts */
+SELECT
+    COUNT(DISTINCT account_id)          AS total_accounts,
+    MIN(baseline_snapshot_dt)           AS min_baseline_snapshot_dt,
+    MAX(latest_snapshot_dt)             AS max_latest_snapshot_dt,
 
-      COUNT(DISTINCT account_id)                                             AS
-  account_count,
+    -- Shelfware Baseline vs Latest
+    ROUND(SUM(shelfware_baseline), 2)   AS shelfware_baseline,
+    ROUND(SUM(shelfware_latest), 2)     AS shelfware_latest,
 
-      ROUND(SUM(shelfware_baseline), 2)                                      AS
-  shelfware_aov_baseline,
-      ROUND(SUM(shelfware_latest),   2)                                      AS
-  shelfware_aov_latest,
+    -- Numerator Baseline vs Latest
+    SUM(numerator_baseline)             AS numerator_baseline,
+    SUM(numerator_latest)               AS numerator_latest,
 
-      ROUND(SUM(shelfware_latest) - SUM(shelfware_baseline), 2)              AS
-  shelfware_aov_change,
-      ROUND(
-          (SUM(shelfware_latest) - SUM(shelfware_baseline))
-          / NULLIF(ABS(SUM(shelfware_baseline)), 0) * 100
-      , 1)                                                                   AS
-  shelfware_aov_pct_change,
+    -- Denominator Baseline vs Latest
+    SUM(denominator_baseline)           AS denominator_baseline,
+    SUM(denominator_latest)             AS denominator_latest,
 
-      ROUND(SUM(pov_baseline), 2)                                            AS
-  pov_baseline,
-      ROUND(SUM(pov_latest),   2)                                            AS
-  pov_latest,
-      ROUND(SUM(pov_latest) - SUM(pov_baseline), 2)                          AS
-  pov_change
+    -- POV Baseline vs Latest
+    ROUND(SUM(pov_baseline), 2)         AS pov_baseline,
+    ROUND(SUM(pov_latest), 2)           AS pov_latest,
 
-  FROM account_detail
-  GROUP BY sales_ou
-  ORDER BY shelfware_aov_change ASC
+    -- POV At Risk Baseline vs Latest
+    ROUND(SUM(pov_at_risk_baseline), 2) AS pov_at_risk_baseline,
+    ROUND(SUM(pov_at_risk_latest), 2)   AS pov_at_risk_latest
+
+FROM account_detail;
