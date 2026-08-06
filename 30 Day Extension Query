@@ -1,0 +1,81 @@
+/*
+======================================================================================
+ PURPOSE: Identify downstream renewal opportunities that should inherit program tags
+         when an upstream opportunity closes with a non-final 30DE status.
+ LOGIC:   Prioritizes the actual Final 30DE opportunity if it exists;
+         otherwise, defaults to the chronologically last opportunity in the chain.
+=====================================================================================
+*/
+use database sse_dm_csg_rpt_prd;
+-- Step 1: Capture all opportunities currently tagged for the Renewals program
+with tagged_opty as (
+    select
+        pp.associated_opportunity as renewal_opty_id_18,
+        LISTAGG(p.Name, ', ') WITHIN GROUP (ORDER BY p.Name) AS Renewal_Programs
+    from cidm.ci_rnd_program_participant_vw pp
+    join cidm.ci_rnd_program_vw p on pp.requested_program = p.ID
+    where p.program_type = 'Renewals'
+      and p.name like '%RP-FY27%' -- Indicator filter used by Ryan's team
+    group by pp.associated_opportunity
+),
+
+-- Step 2: Identify the "Trigger" opportunities (Closed with a non-final 30DE)
+optys_closed_30DE as (
+    select distinct
+        p.renewal_opty_id_18,
+        p.Renewal_Programs, -- Preserving original programs to map forward
+        a.renewal_30de,
+        a.renewal_fcast_code,
+        a.renewal_prior_cntr_id as cntr_id,
+        a.renewal_clsd_dt as tag_opty_30DE_clsd_dt
+    from tagged_opty p
+    join renewals.ci_near_realtime_renewal_opty_vw a on a.renewal_opty_id_18 = p.renewal_opty_id_18
+    where a.renewal_30de is not null
+      and a.renewal_30de not like '%f%' -- Filter out final statuses to isolate the gaps
+      and a.renewal_fcast_code = 'Closed'
+),
+
+-- Step 3: Gather all subsequent opportunities and rank them based on business rules
+ranked_future_optys as (
+    select
+        -- Target Opportunity Details
+        r.renewal_opty_id_18 as next_renewal_opty_id_18,
+        r.renewal_30de as next_renewal_30de,
+        r.renewal_fcast_code as next_fcast_code,
+        r.renewal_clsd_dt as next_clsd_dt,
+        r.renewal_fiscal_year as next_fiscal_year,
+        r.renewal_fiscal_qtr as next_fiscal_qtr,
+        r.renewal_opty_type as next_opty_type,
+
+        -- Actionable Program Mapping Context
+        o.Renewal_Programs as original_programs_to_apply,
+        t.renewal_programs as next_opty_existing_programs,
+        case when t.Renewal_programs is null then 'N' else 'Y' end as next_opty_already_tagged_status,
+
+        -- Original Trigger Opportunity Reference
+        o.renewal_opty_id_18 as original_trigger_opty_id,
+        o.cntr_id,
+        o.tag_opty_30DE_clsd_dt as original_opty_clsd_dt,
+
+        -- The Core Selection Logic Matrix
+        ROW_NUMBER() OVER (
+            PARTITION BY o.renewal_opty_id_18
+            ORDER BY
+                -- Priority 1: Force any explicit final status (%f%) to rank #1
+                CASE WHEN r.renewal_30de LIKE '%f%' THEN 1 ELSE 2 END ASC,
+
+                -- Priority 2 (Default Fallback): Chronologically last opportunity in the chain
+                r.renewal_clsd_dt DESC,
+                r.renewal_opty_id_18 DESC
+        ) as rank_opty_by_cntr
+    from renewals.ci_near_realtime_renewal_opty_vw r
+    join optys_closed_30DE o on o.cntr_id = r.renewal_prior_cntr_id
+    left join tagged_opty t on t.renewal_opty_id_18 = r.renewal_opty_id_18
+    where r.renewal_opty_id_18 != o.renewal_opty_id_18 -- Do not look at the trigger opportunity itself
+      and r.renewal_clsd_dt >= o.tag_opty_30DE_clsd_dt   -- Ensure we are only looking forward in time
+)
+
+-- Step 4: Extract exactly one target opportunity per broken renewal cycle
+select *
+from ranked_future_optys
+where rank_opty_by_cntr = 1;
