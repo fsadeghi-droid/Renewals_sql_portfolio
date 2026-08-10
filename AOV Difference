@@ -1,0 +1,117 @@
+
+-- STEP 1: Build the target list
+  CREATE OR REPLACE TEMPORARY TABLE target_list AS
+  SELECT DISTINCT
+      opt.acct_id                                         AS target_account_id,
+      pp.associated_opportunity                           AS target_opportunity_id,
+      p.name                                              AS target_program_name,
+      p.start_date                                        AS rnd_start_date,
+      CAST(p.createddate AS DATE)                         AS target_program_created_date,
+      TRIM(pp.associated_opportunity::VARCHAR)            AS opp_id_raw,
+      LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15)  AS opp_id_15
+  FROM SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_participant_vw pp
+  JOIN SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_vw p
+      ON pp.requested_program = p.ID
+  LEFT JOIN EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+      ON LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) = LEFT(opt.opty_id, 15)
+      AND opt.curr_rec_flg = 'Y'
+      AND opt.del_flg = 'N'
+  WHERE p.program_type = 'Renewals'
+    AND p.name LIKE '%RP-FY27%';
+
+
+  -- STEP 2: Build the renewals performance table
+  CREATE OR REPLACE TEMPORARY TABLE program_renewals AS
+  SELECT
+      tl.target_program_name,
+      tl.opp_id_15                                                            AS target_opp_id,
+      r.ACCOUNT_NM,
+      r.ACCOUNT_18_ID,
+      r.renewal_opty_id_18,
+      r.renewal_prior_contract_nbr,
+      r.renewal_clsd_dt,
+      r.renewal_fiscal_qtr,
+      r.renewal_fiscal_year,
+      r.renewal_stg_nm,
+      cp.product_l1,
+      cp.product_l2,
+      cp.product_l3,
+      cp.product_names,
+      r.renewal_atr_conv                                                      AS starting_aov,
+      COALESCE(r.renewal_amt_conv, 0)                                         AS ending_aov,
+      CASE
+          WHEN COALESCE(r.renewal_amt_conv, 0) > 0
+          THEN LEAST(r.renewal_amt_conv, r.renewal_atr_conv)
+          ELSE 0
+      END                                                                     AS aov_retained,
+      GREATEST(0, COALESCE(r.renewal_amt_conv, 0) - r.renewal_atr_conv)      AS iacv,
+      CASE
+          WHEN COALESCE(r.renewal_amt_conv, 0) >= r.renewal_atr_conv
+           AND COALESCE(r.renewal_amt_conv, 0)  > 0  THEN 'Fully Retained (Incl. ACV)'
+          WHEN COALESCE(r.renewal_amt_conv, 0)  > 0
+           AND COALESCE(r.renewal_amt_conv, 0)  < r.renewal_atr_conv
+                                                     THEN 'Partial Attrition'
+          WHEN r.renewal_clsd_dt < CURRENT_DATE()
+           AND COALESCE(r.renewal_amt_conv, 0)  = 0  THEN 'Full Attrition'
+          ELSE 'Pending'
+      END                                                                     AS account_program_status
+  FROM target_list tl
+  INNER JOIN renewals.wv_ci_renewal_opty_vw r
+      ON tl.opp_id_15 = LEFT(r.renewal_opty_id_18, 15)
+  LEFT JOIN (
+      SELECT
+          cv.CNTR_NUM,
+          LISTAGG(DISTINCT pv.drvd_prod_lvl_1, ', ') WITHIN GROUP (ORDER BY pv.drvd_prod_lvl_1) AS product_l1,
+          LISTAGG(DISTINCT pv.drvd_prod_lvl_2, ', ') WITHIN GROUP (ORDER BY pv.drvd_prod_lvl_2) AS product_l2,
+          LISTAGG(DISTINCT pv.drvd_prod_lvl_3, ', ') WITHIN GROUP (ORDER BY pv.drvd_prod_lvl_3) AS product_l3,
+          LISTAGG(DISTINCT pv.PROD_NM,         ', ') WITHIN GROUP (ORDER BY pv.PROD_NM)         AS product_names
+      FROM edw_heritage_prd.dm.dim_contract_vw cv
+      JOIN edw_heritage_prd.dm.dim_order_vw ov
+          ON cv.CNTR_ID = ov.CNTR_ID
+          AND ov.ORD_TYP IN ('Renewal','Add-On','Add','Renew','Initial','Auto Renew','AutoRenew','Auto Renewal')
+          AND ov.ORD_STRT_DT <= '2026-08-01'
+          AND ov.ORD_END_DT  >  '2026-02-01'
+      JOIN edw_heritage_prd.dm.fact_order_item_vw oiv
+          ON ov.ORD_ID = oiv.ORD_ID
+          AND oiv.ORD_STAT_TXT IN ('Provisioned','Activated','Expired')
+          AND oiv.DEL_FLG = 'N'
+      JOIN edw_heritage_prd.dm.dim_product_vw pv
+          ON oiv.PROD_ID = pv.PROD_ID
+          AND pv.BKNG_TRTMNT NOT IN (
+              '06-NonACV-NonRecurring-Services',
+              '08-NonRevenue',
+              '05-NonACV-NonRecurring-Usage',
+              '04-NonACV-NonRecurring-License&Support'
+          )
+      GROUP BY 1
+  ) cp ON r.renewal_prior_contract_nbr = cp.CNTR_NUM
+  WHERE r.renewal_clsd_dt BETWEEN '2026-02-01' AND '2026-08-01'
+  QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY tl.opp_id_15
+      ORDER BY r.renewal_clsd_dt DESC, r.renewal_amt_conv DESC NULLS LAST
+  ) = 1;
+  
+
+  -- STEP 3: Detail view
+  SELECT
+      target_program_name                                             AS "Program Name",
+      product_l1                                                      AS "Product L1",
+      product_l2                                                      AS "Product L2",
+      product_l3                                                      AS "Product L3",
+      product_names                                                   AS "Product Name",
+      ACCOUNT_NM                                                      AS "Account Name",
+      ACCOUNT_18_ID                                                   AS "Account ID",
+      renewal_opty_id_18                                              AS "Renewal Opp ID",
+      renewal_prior_contract_nbr                                      AS "Prior Contract #",
+      renewal_clsd_dt                                                 AS "Renewal Close Date",
+      renewal_fiscal_qtr                                              AS "Fiscal Quarter",
+      renewal_fiscal_year                                             AS "Fiscal Year",
+      renewal_stg_nm                                                  AS "Renewal Stage",
+      starting_aov                                                    AS "Starting AOV",
+      aov_retained                                                    AS "AOV Retained",
+      aov_retained - starting_aov                                     AS "AOV Lost",
+      ROUND(aov_retained / NULLIFZERO(starting_aov), 4)              AS "Retained %",
+      iacv                                                            AS "iACV",
+      ending_aov                                                      AS "Ending AOV"
+  FROM program_renewals
+  ORDER BY target_program_name, ACCOUNT_NM;
