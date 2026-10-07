@@ -1,0 +1,368 @@
+WITH Target_List AS (
+    SELECT DISTINCT
+        opt.acct_id                                        AS target_account_id,
+        pp.associated_opportunity                          AS target_opportunity_id,
+        p.name                                             AS target_program_name,
+        p.start_date                                       AS rnd_start_date,
+        CAST(p.createddate AS DATE)                        AS target_program_created_date,
+        TRIM(pp.associated_opportunity::VARCHAR)           AS opp_id_raw,
+        LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) AS opp_id_15
+    FROM SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_participant_vw pp
+    JOIN SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_vw p ON pp.requested_program = p.ID
+    LEFT JOIN EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+        ON LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) = LEFT(opt.opty_id, 15)
+        AND opt.curr_rec_flg = 'Y'
+        AND opt.del_flg = 'N'
+    WHERE p.program_type = 'Renewals'
+      AND p.name LIKE '%RP-FY27%'
+      AND p.name LIKE '%Shelfware Mitigation%'
+),
+
+-- Fiscal quarter → snapshot date at quarter start; adjust dates to match what exists in SHELFWARE_ARI_SUMMARY
+quarter_snapshot_map AS (
+    SELECT column1 AS fiscal_qtr, column2::DATE AS qtr_start_snapshot
+    FROM VALUES
+        ('FY2027Q1', '2026-02-01'),
+        ('FY2027Q2', '2026-05-01'),
+        ('FY2027Q3', '2026-08-01'),
+        ('FY2027Q4', '2026-11-01'),
+        ('FY2028Q1', '2027-02-01'),
+        ('FY2028Q2', '2027-05-01'),
+        ('FY2028Q3', '2027-08-01'),
+        ('FY2028Q4', '2027-11-01')
+),
+
+-- Pull close fiscal quarter for each program opportunity from the renewal view
+-- NOTE: if an opp appears in multiple rows of WV_CI_RENEWAL_OPTY_VW, DISTINCT prevents fan-out
+target_opp_quarters AS (
+    SELECT DISTINCT
+        tl.target_account_id,
+        tl.target_opportunity_id,
+        tl.target_program_name,
+        tl.rnd_start_date,
+        tl.target_program_created_date,
+        tl.opp_id_15,
+        rn.renewal_fiscal_qtr,
+        rn.renewal_close_month,
+        LEFT(rn.renewal_prior_cntr_id, 15)   AS renewal_prior_cntr_id,
+        -- Segmentation fields
+        rn.macro_segment,
+        rn.acct_aov_band,
+        NVL(o.sales_ou,   'Other')            AS sales_ou,
+        NVL(o.sales_ou_core_ou_with_df, 'Other')       AS sales_ou_core_ou_with_df,
+        NVL(o.sales_ou_1, 'Other')            AS sales_ou_1,
+        NVL(o.sales_ou_1_core_ou_with_df, 'other')     AS sales_ou_1_core_ou_with_df
+    FROM Target_List tl
+    LEFT JOIN SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW rn
+        ON LEFT(tl.opp_id_15, 15) = LEFT(rn.renewal_opty_id, 15)
+    LEFT JOIN SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.DIM_SALES_HIERARCHY_OU_VW o
+        ON  o.account_id        = rn.account_18_id
+        AND o.book_of_business  = rn.book_of_business
+        AND rn.renewal_close_month BETWEEN o.dbt_valid_from AND o.dbt_valid_to
+),
+
+
+shelfware_summary AS (
+    SELECT
+        account_id,
+        CASE WHEN sub_category_final LIKE '%Tableau%' THEN 'Tableau'
+             ELSE sub_category_final
+        END AS sub_category_final,
+        CASE WHEN sub_category_final LIKE '%Tableau%' THEN 'Tableau'
+             ELSE drvd_prod_lvl_1
+        END AS drvd_prod_lvl_1,
+        snapshot_dt,
+        SUM(total_aov)           AS total_aov,
+        SUM(total_shelfware_aov) AS shelfware_aov
+    FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.SHELFWARE_ARI_SUMMARY
+    WHERE sub_category_final <> 'Tableau Server Analytics'
+      AND snapshot_dt IN (SELECT qtr_start_snapshot FROM quarter_snapshot_map)
+    GROUP BY ALL
+),
+
+adoption_cohorts AS (
+    SELECT
+        account_id,
+        snapshot_dt,
+        sub_category_final,
+        MIN(CASE WHEN adoption_cohort_status = 'Unhealthy' THEN 'Unhealthy'
+                 ELSE 'Healthy' END) AS adoption_cohort_status,
+        MIN_BY(executive_cohort,
+            CASE executive_cohort
+                WHEN 'No Usage'       THEN 1
+                WHEN 'Low Usage'      THEN 2
+                WHEN 'Declining Usage' THEN 3
+                ELSE 4
+            END
+        ) AS executive_cohort
+    FROM (
+        SELECT
+            account_id,
+            snapshot_dt,
+            CASE
+                WHEN sub_category IN ('B2B Order Management - Industries',
+                                      'B2C Order Management - Industries') THEN 'Order Management'
+                WHEN sub_category IN ('MuleSoft Integration - Flows/Messages') THEN 'MuleSoft Integration'
+                WHEN sub_category IN ('Slack AI', 'Slack Elevate')            THEN 'Slack'
+                WHEN sub_category LIKE '%Tableau%'                             THEN 'Tableau'
+                ELSE sub_category
+            END AS sub_category_final,
+            CASE
+                WHEN executive_cohort IN ('No Usage','Low Usage','Declining Usage') THEN 'Unhealthy'
+                WHEN executive_cohort IN ('Consistent Usage','Growing Usage')       THEN 'Healthy'
+                ELSE 'Other'
+            END AS adoption_cohort_status,
+            executive_cohort
+        FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.SHELFWARE_ADOPTION_COHORTS
+        WHERE COALESCE(TRY_TO_BOOLEAN(is_sela), FALSE) = FALSE
+          AND sub_category <> 'Tableau Server Analytics'
+          AND snapshot_dt IN (SELECT qtr_start_snapshot FROM quarter_snapshot_map)
+    )
+    GROUP BY account_id, snapshot_dt, sub_category_final
+),
+
+account_segment AS (
+    SELECT acct_id, MAX(csg_territory) AS csg_territory
+    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
+    GROUP BY acct_id
+),
+
+-- Unhealthy products per account per snapshot (snapshot_dt now carried through)
+shelfware_base AS (
+    SELECT
+        s.account_id,
+        s.snapshot_dt,
+        s.drvd_prod_lvl_1,
+        seg.csg_territory,
+        SUM(s.total_aov)    AS total_aov,
+        SUM(s.shelfware_aov) AS shelfware_aov,
+        LISTAGG(
+            s.sub_category_final || ' (' || a.executive_cohort || ': $' ||
+            TO_CHAR(s.shelfware_aov, '999,999,999') || ')',
+            ' | '
+        ) WITHIN GROUP (ORDER BY s.shelfware_aov DESC) AS unhealthy_cohort_details
+    FROM shelfware_summary s
+    INNER JOIN adoption_cohorts a
+        ON  s.account_id         = a.account_id
+        AND s.sub_category_final = a.sub_category_final
+        AND s.snapshot_dt        = a.snapshot_dt
+    LEFT JOIN account_segment seg ON s.account_id = seg.acct_id
+    WHERE a.adoption_cohort_status = 'Unhealthy'
+      AND s.drvd_prod_lvl_1 IS NOT NULL
+      AND s.shelfware_aov > 0
+    GROUP BY ALL
+    HAVING SUM(s.shelfware_aov) >= CASE
+        WHEN seg.csg_territory = 'SMB' THEN 50000
+        ELSE 200000
+    END
+),
+-- ── Product ATR: same strategy as retention programs, adapted to drvd_prod_lvl_1 ──
+
+-- Base AOV per contract/month at drvd_prod_lvl_1 (Tableau-normalized)
+sw_fact_aov_base AS (
+    SELECT
+        cntr_id,
+        dt_key,
+        ord_itm_end_dt,
+        cntr_end_dt,
+        global_co_combo_id,
+        CASE WHEN drvd_prod_lvl_1 LIKE '%Tableau%' THEN 'Tableau'
+             ELSE drvd_prod_lvl_1 END AS product,
+        SUM(IFNULL(alloc_aov, 0)) AS alloc_aov
+    FROM EDW_HERITAGE_PRD.DM.FACT_AOV_SS_VW
+    WHERE drvd_prod_lvl_1 IS NOT NULL
+    GROUP BY ALL
+    HAVING SUM(qty) > 0
+),
+
+-- Non-SELA closed contracts
+sw_clsd_cntr AS (
+    SELECT DISTINCT
+        a.dt_key,
+        a.cntr_id,
+        a.global_co_combo_id,
+        'N'                    AS is_sela,
+        DATE(a.cntr_end_dt)    AS cntr_end_dt,
+        a.product,
+        SUM(a.alloc_aov)       AS aov
+    FROM EDW_HERITAGE_PRD.DM.DIM_CONTRACT_VW c
+    INNER JOIN sw_fact_aov_base a ON c.cntr_id = a.cntr_id
+    WHERE c.cntr_end_dt       < CURRENT_DATE
+      AND a.ord_itm_end_dt    < CURRENT_DATE
+      AND c.sela_contract IS NULL
+    GROUP BY ALL
+),
+
+-- SELA contract mapping (identical to retention programs query)
+sela_orders AS (
+    SELECT DISTINCT
+        s.cntr_id,
+        DATE(s.cntr_end_dt)   AS cntr_end_dt,
+        s.sela_contract,
+        o.sfdcrelatedquote__c,
+        r.rec_nm
+    FROM EDW_HERITAGE_PRD.DM.DIM_CONTRACT_VW s
+    LEFT JOIN EDW_PRD.ODS.ORDER_SV o
+        ON SUBSTR(o.contractid, 1, 15) = s.cntr_id
+    JOIN EDW_HERITAGE_PRD.ODS.ODS_APTTUS_PROPOSAL_C_VW e
+        ON e.id = o.sfdcrelatedquote__c
+    JOIN EDW_HERITAGE_PRD.DM.DIM_RECORD_TYPE_VW r
+        ON r.rec_typ_id = e.recordtypeid
+    WHERE s.sela_contract IS NOT NULL
+      AND o.sfdcrelatedquote__c IS NOT NULL
+      AND s.cntr_stat_txt NOT LIKE 'Terminated%'
+      AND o.type != 'Cancel'
+),
+
+sela_map AS (
+    SELECT DISTINCT
+        b.sfdcrelatedquote__c,
+        b.rec_nm,
+        b.cntr_id             AS sela_billable,
+        c.cntr_id             AS sela_commissionable,
+        c.cntr_end_dt
+    FROM sela_orders b
+    LEFT JOIN sela_orders c
+        ON  b.sfdcrelatedquote__c = c.sfdcrelatedquote__c
+        AND c.sela_contract = 'SELA Commissionable'
+    WHERE b.sela_contract = 'SELA Billable'
+),
+
+-- SELA commissionable contracts with product ATR
+sw_clsd_sela_cntr AS (
+    SELECT DISTINCT
+        a.dt_key,
+        s.sela_commissionable AS comm_cntr_id,
+        s.cntr_end_dt,
+        'Y'                   AS is_sela,
+        a.global_co_combo_id,
+        a.product,
+        SUM(a.alloc_aov)      AS aov
+    FROM (SELECT DISTINCT sela_commissionable, cntr_end_dt FROM sela_map) s
+    INNER JOIN sw_fact_aov_base a ON s.sela_commissionable = a.cntr_id
+    WHERE s.cntr_end_dt       < CURRENT_DATE
+      AND a.ord_itm_end_dt    < CURRENT_DATE
+    GROUP BY ALL
+),
+
+-- Combined non-SELA + SELA product ATR keyed by opportunity
+sw_prod_cntr AS (
+    -- Non-SELA
+    SELECT DISTINCT
+        LEFT(r.renewal_opty_id, 15) AS opp_id_15,
+        c.cntr_id,
+        c.is_sela,
+        c.dt_key,
+        c.global_co_combo_id,
+        c.product,
+        SUM(c.aov)            AS prod_atr,
+        'non_sela'            AS data_source
+    FROM sw_clsd_cntr c
+    JOIN SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW r
+        ON SUBSTR(r.renewal_prior_cntr_id, 1, 15) = c.cntr_id
+    WHERE TRUNC(r.renewal_clsd_dt, 'MONTH') = ADD_MONTHS(c.dt_key, 1)
+      AND r.renewal_fcast_code NOT IN ('Omitted')
+      AND (r.renewal_opty_type IN ('Renewal', 'ISV', 'Contract')
+           OR r.renewal_opty_type LIKE 'Off-Cycle%')
+      AND r.renewal_fcast_attrition_conv <= 0
+      AND (
+          ((r.renewal_30de NOT IN ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE')
+            AND r.renewal_stg_nm IN ('05 Closed', 'Dead Attrition'))
+           OR r.renewal_stg_nm NOT IN ('05 Closed', 'Dead Attrition'))
+          OR r.renewal_30de IS NULL
+      )
+    GROUP BY ALL
+
+    UNION ALL
+
+    -- SELA
+    SELECT DISTINCT
+        LEFT(r.renewal_opty_id, 15) AS opp_id_15,
+        s.sela_billable       AS cntr_id,
+        c.is_sela,
+        c.dt_key,
+        c.global_co_combo_id,
+        c.product,
+        SUM(c.aov)            AS prod_atr,
+        'sela'                AS data_source
+    FROM (
+        SELECT DISTINCT
+            c2.dt_key,
+            s2.sela_billable,
+            c2.comm_cntr_id,
+            c2.is_sela,
+            c2.global_co_combo_id,
+            c2.product,
+            c2.aov,
+            DENSE_RANK() OVER (PARTITION BY c2.comm_cntr_id ORDER BY c2.dt_key DESC) AS rank_for_aov
+        FROM sw_clsd_sela_cntr c2
+        JOIN sela_map s2 ON c2.comm_cntr_id = s2.sela_commissionable
+    ) c
+    JOIN sela_map s ON c.comm_cntr_id = s.sela_commissionable
+    JOIN SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW r
+        ON SUBSTR(r.renewal_prior_cntr_id, 1, 15) = s.sela_billable
+    WHERE c.rank_for_aov = 1
+      AND TRUNC(r.renewal_clsd_dt, 'MONTH') = ADD_MONTHS(c.dt_key, 1)
+      AND r.renewal_fcast_code NOT IN ('Omitted')
+      AND (r.renewal_opty_type IN ('Renewal', 'ISV', 'Contract')
+           OR r.renewal_opty_type LIKE 'Off-Cycle%')
+      AND r.renewal_fcast_attrition_conv <= 0
+      AND (
+          ((r.renewal_30de NOT IN ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE')
+            AND r.renewal_stg_nm IN ('05 Closed', 'Dead Attrition'))
+           OR r.renewal_stg_nm NOT IN ('05 Closed', 'Dead Attrition'))
+          OR r.renewal_30de IS NULL
+      )
+    GROUP BY ALL
+),
+
+-- Fallback: direct prior-contract lookup for opps not matched by sw_prod_cntr
+sw_fact_aov_fallback AS (
+    SELECT
+        cntr_id,
+        product,
+        ADD_MONTHS(dt_key, -1) AS dt_key,
+        ROUND(SUM(alloc_aov), 2) AS prod_atr
+    FROM sw_fact_aov_base
+    GROUP BY ALL
+)
+
+SELECT
+    toq.target_account_id,
+    toq.target_opportunity_id,
+    toq.target_program_name,
+    toq.rnd_start_date,
+    toq.target_program_created_date,
+    toq.renewal_fiscal_qtr,
+    toq.renewal_close_month,
+    qsm.qtr_start_snapshot                           AS targeted_at_snapshot,
+    sb.drvd_prod_lvl_1                               AS targeted_product_l1,
+    sb.shelfware_aov,
+    sb.total_aov,
+    sb.unhealthy_cohort_details,
+    sb.csg_territory,
+    toq.macro_segment,                               -- NEW
+    toq.acct_aov_band,                               -- NEW
+    toq.sales_ou,                                    -- NEW
+    toq.sales_ou_1,                                  -- NEW
+    toq.sales_ou_core_ou_with_df,                      -- NEW
+    toq.sales_ou_1_core_ou_with_df,                  -- NEW
+    ROUND(pc.prod_atr, 2)                            AS prod_atr_main,
+    ROUND(p1.prod_atr, 2)                            AS prod_atr_fallback,
+    ROUND(COALESCE(pc.prod_atr, p1.prod_atr, 0), 2) AS prod_atr
+FROM target_opp_quarters toq
+JOIN quarter_snapshot_map qsm
+    ON toq.renewal_fiscal_qtr = qsm.fiscal_qtr
+JOIN shelfware_base sb
+    ON  sb.account_id  = toq.target_account_id
+    AND sb.snapshot_dt = qsm.qtr_start_snapshot
+-- Primary: opportunity-based SELA-aware match
+LEFT JOIN sw_prod_cntr pc
+    ON  pc.opp_id_15 = toq.opp_id_15
+    AND pc.product   = sb.drvd_prod_lvl_1
+-- Fallback: prior contract ID + month alignment
+LEFT JOIN sw_fact_aov_fallback p1
+    ON  p1.cntr_id = toq.renewal_prior_cntr_id
+    AND p1.product = sb.drvd_prod_lvl_1
+    AND p1.dt_key  = DATE_TRUNC('month', ADD_MONTHS(toq.renewal_close_month, -1))
+ORDER BY sb.csg_territory, sb.shelfware_aov DESC;
